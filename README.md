@@ -12,10 +12,6 @@ working**, and lets it sleep the moment the agent is just waiting for you.
 
 <img src="assets/lucid-demo.gif" alt="Lucid in use: an agent starts a turn, Lucid catches it, the comparison, the wordmark" width="820">
 
-<table><tr><td><b>Caffeine</b></td><td>is a switch.</td></tr>
-<tr><td><b>Amphetamine</b></td><td>watches CPU.</td></tr>
-<tr><td><b><i>lucid</i></b></td><td>listens to the agent.</td></tr></table>
-
 </div>
 
 ---
@@ -261,8 +257,17 @@ Lucid is free and always will be. The one thing it needs money for is an
 **Apple Developer membership at $99/year**, which is what allows the app to be notarised —
 so it installs without the `xattr` dance above and without a Gatekeeper warning.
 
-**[Sponsor this project](https://github.com/sponsors/ManasvinYadav)** — the goal is $99, and
-that is the whole goal.
+<div align="center">
+
+<a href="https://github.com/sponsors/ManasvinYadav">
+  <img alt="Sponsor Lucid — $99 notarisation goal" src="https://img.shields.io/badge/Sponsor%20Lucid-%2499%20notarisation%20goal-db61a2?style=for-the-badge&logo=githubsponsors&logoColor=white">
+</a>
+
+**[github.com/sponsors/ManasvinYadav](https://github.com/sponsors/ManasvinYadav)**
+
+</div>
+
+The goal is $99, and that is the whole goal.
 
 ## Credits
 
