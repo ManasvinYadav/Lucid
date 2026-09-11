@@ -47,6 +47,8 @@ quarantine flag once:
 xattr -dr com.apple.quarantine /Applications/Lucid.app
 ```
 
+Homebrew removed its `--no-quarantine` flag in version 6, so this is now the only route.
+
 Notarisation needs a paid Apple Developer account. That is exactly what the
 [sponsor goal](#sponsor) is for.
 
