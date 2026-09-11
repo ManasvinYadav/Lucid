@@ -1,0 +1,24 @@
+#!/bin/sh
+# Lucid hook client.  usage: lucid-notify <agent> <working|idle|ended> [detail]
+#
+# Must never block, never fail the calling agent, and never write to its stdout.
+# Always exits 0.
+SOCK="$HOME/.lucid/agent.sock"
+[ -S "$SOCK" ] || exit 0
+
+AGENT="${1:-unknown}"
+STATUS="${2:-idle}"
+DETAIL="${3:-}"
+
+# Prefer the session id the agent gives us; fall back to the parent pid so that
+# concurrent sessions from the same agent stay distinct.
+SID="${CLAUDE_SESSION_ID:-${CODEX_SESSION_ID:-${LUCID_SESSION_ID:-$PPID}}}"
+
+# PPID is the agent process itself. Reporting it lets the app watch for that pid
+# exiting and drop the session instantly, instead of waiting out the stale-session
+# timeout when an agent is killed mid-turn.
+printf '{"agent":"%s","session_id":"%s","status":"%s","detail":"%s","pid":%s}\n' \
+    "$AGENT" "$SID" "$STATUS" "$DETAIL" "$PPID" \
+  | /usr/bin/nc -U "$SOCK" >/dev/null 2>&1 &
+
+exit 0

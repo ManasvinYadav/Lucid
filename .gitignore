@@ -1,0 +1,9 @@
+# Build output — reproduce with ./build.sh
+build/
+dist/
+
+# The full Convergence track is Scott Buckley's work, not ours. The 15-second
+# window of it that the film uses ships inside media/Lucid-music.mp4, credited.
+media/Convergence.mp3
+
+.DS_Store
