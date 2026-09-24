@@ -47,23 +47,20 @@ struct AgentSession: Identifiable {
     var startedOnAC: Bool?
     var source: SessionSource
     var pid: pid_t?
+    /// Re-adopted after a restart and not heard from since. Its pid may be a reuse, or its
+    /// turn may have ended while Lucid was down, so a live pid alone does not keep it.
+    var recovered = false
 
     var id: String { key }
     var isWorking: Bool { status == .working }
 
     var displayName: String {
-        switch agent {
-        case "claude-code": return "Claude Code"
-        case "codex":       return "Codex"
-        case "opencode":    return "opencode"
-        case "gemini":      return "Gemini"
-        case "copilot":     return "Copilot"
-        default:            return agent.capitalized
-        }
+        // A process row's agent is its whitelist entry, which may be a path fragment.
+        AgentRegistry.find(agent)?.name ?? agent.trimmingCharacters(in: .punctuationCharacters).capitalized
     }
 
     var statusLine: String {
-        if source == .process { return "Active Process" }
+        if source == .process { return status == .working ? "Active Process" : "Idle Process" }
         switch status {
         case .working: return "Working (\(detail ?? "running"))"
         case .idle:    return "Idle (\(detail ?? "waiting for prompt"))"
@@ -102,6 +99,10 @@ final class AgentLifecycleManager {
     var onSessionsChanged: (() -> Void)?
 
     private var registry: [String: AgentSession] = [:]
+    /// status.json as the previous run left it, read before this run can write it:
+    /// AppState's init overwrites the file (its mode didSet runs evaluate) before the
+    /// re-adoption below gets to read it.
+    private let statusAtLaunch = try? Data(contentsOf: AppPaths.status)
     private var shouldArm = false
     private var graceTask: Task<Void, Never>?
     private var reaper: Timer?
@@ -138,6 +139,11 @@ final class AgentLifecycleManager {
 
     func handle(_ event: AgentEvent) {
         let key = Self.key(agent: event.agent, session: event.session_id)
+        // The wire pid is untrusted input. Only a live process of this user can be an
+        // agent: pid 0 or 1 (a detached hook reports launchd) never exits and pinned the
+        // Mac awake, and a negative pid trapped in makeProcessSource.
+        let pid = event.pid.flatMap { Self.isOwnLiveProcess($0) ? $0 : nil }
+        let detail = event.detail.flatMap { $0.isEmpty ? nil : $0 }
 
         if event.status == .ended {
             exitWatchers[key]?.cancel(); exitWatchers[key] = nil
@@ -159,21 +165,36 @@ final class AgentLifecycleManager {
             }
             existing.status = event.status
             existing.lastSeen = Date()
-            if let d = event.detail { existing.detail = d }
-            if let p = event.pid { existing.pid = p }
+            existing.recovered = false
+            if let d = detail { existing.detail = d }
+            if let p = pid { existing.pid = p }
             registry[key] = existing
         } else {
+            // A new session in a process whose other sessions sit idle: those are over.
+            // Cline in VS Code runs every task under one extension host and sends no end
+            // event, so finished tasks otherwise stayed listed until the window closed.
+            if let p = pid {
+                for (k, s) in registry where s.source == .hook && s.agent == event.agent
+                                              && s.pid == p && !s.isWorking {
+                    exitWatchers[k]?.cancel(); exitWatchers[k] = nil
+                    registry[k] = nil
+                }
+            }
             registry[key] = AgentSession(
                 key: key, agent: event.agent, sessionID: event.session_id,
-                status: event.status, detail: event.detail,
+                status: event.status, detail: detail,
                 lastSeen: Date(),
                 startedWorkingAt: event.status == .working ? Date() : nil,
                 batteryAtStart: event.status == .working ? batteryReader().pct : nil,
                 startedOnAC: event.status == .working ? batteryReader().onAC : nil,
-                source: .hook, pid: event.pid)
+                source: .hook, pid: pid)
         }
 
-        if let p = event.pid, event.status != .ended { watchForExit(key: key, pid: p) }
+        if let p = pid {
+            watchForExit(key: key, pid: p)
+            // The hook now speaks for this process; a CPU-guessed row for it is noise.
+            if registry.removeValue(forKey: "process#\(p)") != nil { lastCPUSample[p] = nil }
+        }
         publish()
     }
 
@@ -181,13 +202,19 @@ final class AgentLifecycleManager {
     /// any pid without special permission. Without it, an agent killed mid-turn would keep
     /// the Mac awake for the whole stale-session timeout.
     private func watchForExit(key: String, pid: pid_t) {
-        guard exitWatchers[key] == nil else { return }
-        guard kill(pid, 0) == 0 || errno == EPERM else { return }   // pid must exist
+        // Follow the latest pid. Staying on the first one meant a transient shell that
+        // happened to send the first event reaped the session the moment it exited.
+        if let w = exitWatchers[key] {
+            guard w.handle != pid else { return }
+            w.cancel()
+            exitWatchers[key] = nil
+        }
+        guard Self.isOwnLiveProcess(pid) else { return }
 
         let src = DispatchSource.makeProcessSource(identifier: pid, eventMask: .exit, queue: .main)
         src.setEventHandler { [weak self] in
             MainActor.assumeIsolated {
-                guard let self else { return }
+                guard let self, self.exitWatchers[key]?.handle == pid else { return }
                 log.notice("agent pid \(pid) exited — reaping \(key, privacy: .public)")
                 self.finish(key: key, reason: "agent exited")
                 self.exitWatchers[key]?.cancel()
@@ -198,13 +225,24 @@ final class AgentLifecycleManager {
         exitWatchers[key] = src
     }
 
+    /// Agents always run as the same user as the app. Anything else — pid 0 or 1, another
+    /// user's process, a dead pid — cannot be one, and must not be kept alive on its say-so.
+    nonisolated static func isOwnLiveProcess(_ pid: pid_t) -> Bool {
+        guard pid > 1 else { return false }
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
+        var info = kinfo_proc()
+        var size = MemoryLayout<kinfo_proc>.stride
+        guard sysctl(&mib, 4, &info, &size, nil, 0) == 0, size > 0 else { return false }
+        return info.kp_proc.p_pid == pid && info.kp_eproc.e_ucred.cr_uid == getuid()
+    }
+
     /// Write one stretch of work to history. No-op unless the session was actually
     /// working, and `SessionHistory` drops anything shorter than a couple of seconds.
-    private func recordWork(_ s: AgentSession, reason: String) {
+    private func recordWork(_ s: AgentSession, reason: String, ended: Date = Date()) {
         guard let started = s.startedWorkingAt else { return }
         let now = batteryReader()
         SessionHistory.shared.record(
-            agent: s.displayName, started: started, ended: Date(), reason: reason,
+            agent: s.displayName, started: started, ended: ended, reason: reason,
             batteryStart: s.batteryAtStart, batteryEnd: now.pct,
             // Only "on battery" if it never touched AC at either end; a session that was
             // plugged in for part of it cannot be attributed cleanly.
@@ -232,18 +270,23 @@ final class AgentLifecycleManager {
         var reaped: [String] = []
         var alive: [String] = []
 
-        for (k, s) in registry where s.source == .hook && s.isWorking && s.lastSeen < cutoff {
-            if let pid = s.pid, Self.processIsAlive(pid) {
-                // Still running. Refresh so the next window is measured from now, and say
-                // in the UI that this is inferred from the process, not reported by it.
+        for (k, s) in registry where s.source == .hook && s.lastSeen < cutoff {
+            if let pid = s.pid, !s.recovered, Self.isOwnLiveProcess(pid) {
+                // Still running. A silent working session is kept, refreshed so the next
+                // window is measured from now, and labelled as inferred from the process.
+                // A silent idle one is simply left alone: the agent is open, waiting.
+                guard s.isWorking else { continue }
                 registry[k]?.lastSeen = Date()
                 registry[k]?.detail = "Running (no heartbeat — process alive)"
                 alive.append(k)
             } else {
-                registry[k]?.status = .idle
-                registry[k]?.detail = s.pid == nil
-                    ? "stale — no heartbeat"
-                    : "stale — agent process gone"
+                // Silent and nothing alive behind it: gone. Removed and recorded, not
+                // relabelled — relabelled rows piled up in the menu for good.
+                if let started = s.startedWorkingAt {
+                    recordWork(s, reason: "reaped — no heartbeat", ended: max(started, s.lastSeen))
+                }
+                registry.removeValue(forKey: k)
+                exitWatchers[k]?.cancel(); exitWatchers[k] = nil
                 reaped.append(k)
             }
         }
@@ -257,12 +300,6 @@ final class AgentLifecycleManager {
         if !alive.isEmpty || !reaped.isEmpty { publish() }
     }
 
-    /// True if the pid still names a running process. EPERM means it exists but belongs to
-    /// another user, which still counts as alive.
-    nonisolated static func processIsAlive(_ pid: pid_t) -> Bool {
-        kill(pid, 0) == 0 || errno == EPERM
-    }
-
     /// Re-adopt sessions that outlived a crash.
     ///
     /// The registry deliberately starts empty — persisting "working" blind would let one
@@ -270,18 +307,22 @@ final class AgentLifecycleManager {
     /// belief, it is a check: only a session whose recorded pid is still a running process
     /// comes back, and it comes back labelled as recovered.
     func readoptSurvivingSessions() {
-        guard let data = try? Data(contentsOf: AppPaths.status),
+        guard let data = statusAtLaunch,
               let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let rows = root["sessions"] as? [[String: Any]]
         else { return }
 
         var adopted = 0
         for row in rows {
+            // Hook rows only. A process-fallback row came back as a "hook" session that no
+            // hook would ever update, and held the Mac awake for as long as that process
+            // (an ollama daemon, a Cursor helper) lived. The scanner rebuilds those itself.
             guard let agent = row["agent"] as? String,
                   let sid = row["session"] as? String,
+                  (row["source"] as? String) == SessionSource.hook.rawValue,
                   (row["status"] as? String) == AgentStatus.working.rawValue,
                   let rawPid = row["pid"] as? Int32,
-                  Self.processIsAlive(rawPid)
+                  Self.isOwnLiveProcess(rawPid)
             else { continue }
 
             let key = Self.key(agent: agent, session: sid)
@@ -291,7 +332,7 @@ final class AgentLifecycleManager {
                 status: .working, detail: "Recovered after restart",
                 lastSeen: Date(), startedWorkingAt: Date(),
                 batteryAtStart: batteryReader().pct, startedOnAC: batteryReader().onAC,
-                source: .hook, pid: rawPid)
+                source: .hook, pid: rawPid, recovered: true)
             watchForExit(key: key, pid: rawPid)
             adopted += 1
         }
@@ -422,8 +463,19 @@ final class AgentLifecycleManager {
         while true {
             let client = accept(fd, nil, nil)
             if client < 0 {
-                if errno == EINTR { continue }
-                return  // listener closed
+                // A client that hung up while queued, or a momentary fd shortage, must not
+                // end the listener — it used to, silently, while the UI said "Accepting".
+                switch errno {
+                case EINTR, ECONNABORTED: continue
+                case EMFILE, ENFILE, ENOMEM, ENOBUFS: usleep(100_000); continue
+                default:
+                    let why = String(cString: strerror(errno))
+                    Task { @MainActor [weak self] in
+                        self?.isListening = false
+                        self?.listenerError = "accept() failed: \(why)"
+                    }
+                    return
+                }
             }
             handleClient(client)
         }
@@ -439,12 +491,15 @@ final class AgentLifecycleManager {
 
         var tv = timeval(tv_sec: 2, tv_usec: 0)
         setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        // The timeout above is per read. This bounds the whole exchange, so a client that
+        // trickles a byte a second cannot hold the only accept thread for hours.
+        let deadline = Self.machNowNanos() + 2_000_000_000
 
         var pending = Data()
         var buf = [UInt8](repeating: 0, count: 4096)
         var delivered = 0
 
-        while true {
+        while Self.machNowNanos() < deadline {
             let n = read(client, &buf, buf.count)
             if n <= 0 { break }
             pending.append(contentsOf: buf[0..<n])
@@ -478,29 +533,34 @@ final class AgentLifecycleManager {
     /// Discovery via one sysctl call. `proc_listallpids` is avoided deliberately: it can
     /// silently return a partial list to a non-root caller, with no truncation indicator.
     private func scanProcesses() {
-        guard prefs.processFallbackEnabled else {
-            if registry.contains(where: { $0.value.source == .process }) {
-                registry = registry.filter { $0.value.source != .process }
-                publish()
-            }
+        // Off, or nothing to match: drop every process row. An empty whitelist used to
+        // return before this, leaving a working row in place forever.
+        let hookAgents = Set(registry.values.compactMap { $0.source == .hook ? $0.agent : nil })
+        let needles = prefs.processWhitelist.map { $0.lowercased() }
+            .filter { !$0.isEmpty && !Self.reportsViaHooks($0, live: hookAgents) }
+        guard prefs.processFallbackEnabled, !needles.isEmpty else {
+            let rows = registry.filter { $0.value.source == .process }
+            guard !rows.isEmpty else { return }
+            for (k, s) in rows { recordWork(s, reason: "process tracking off"); registry[k] = nil }
+            lastCPUSample.removeAll()
+            publish()
             return
         }
 
-        let needles = prefs.processWhitelist.map { $0.lowercased() }
-        guard !needles.isEmpty else { return }
-
         let me = getuid()
+        let hookPids = Set(registry.values.compactMap { $0.source == .hook ? $0.pid : nil })
         var seen = Set<String>()
+        var matchedPids = Set<pid_t>()
         var changed = false
 
         for proc in Self.liveProcesses() {
             // rusage is EPERM across uid boundaries, so only consider our own processes.
-            guard proc.uid == me else { continue }
-            guard let path = Self.executablePath(proc.pid)?.lowercased() else { continue }
-            guard let needle = needles.first(where: { path.contains($0) }) else { continue }
+            guard proc.uid == me, !hookPids.contains(proc.pid),
+                  let needle = Self.matchedNeedle(proc.pid, needles) else { continue }
 
             let key = "process#\(proc.pid)"
             seen.insert(key)
+            matchedPids.insert(proc.pid)
             let busy = cpuCoresBusy(proc.pid)
             let active = busy >= prefs.processCPUThreshold
 
@@ -533,14 +593,68 @@ final class AgentLifecycleManager {
             }
         }
 
-        // Drop process entries whose pid is gone.
+        // Drop process entries whose pid is gone, recording the work they were doing.
         for (k, s) in registry where s.source == .process && !seen.contains(k) {
+            recordWork(s, reason: "process exited")
             registry.removeValue(forKey: k)
-            lastCPUSample.removeValue(forKey: s.pid ?? -1)
             changed = true
         }
+        // Samples for every matched pid, row or not; anything else is a dead pid whose
+        // number may be reused.
+        lastCPUSample = lastCPUSample.filter { matchedPids.contains($0.key) }
 
         if changed { publish() }
+    }
+
+    /// An agent that reports through hooks, its own or Claude Code's relabelled, has its
+    /// state from the source. Guessing from its busy processes as well (Cursor indexing, a
+    /// TS server) held the Mac awake while its hooks said it was waiting.
+    private static func reportsViaHooks(_ needle: String, live: Set<String>) -> Bool {
+        guard let owner = ["cursor helper": "cursor", "cline": "cline"][needle] else { return false }
+        return live.contains(owner) || (AgentRegistry.find(owner)?.installed ?? false)
+    }
+
+    /// The whitelist entry this process answers to, if any.
+    ///
+    /// Matched against the names a process goes by, never its full path: a path match on
+    /// "gemini" caught every helper inside Google's Gemini desktop app. For an interpreter
+    /// the executable is just `node` or `python`, so the script it runs is checked too —
+    /// that is the only way a node- or python-based CLI can match at all.
+    nonisolated static func matchedNeedle(_ pid: pid_t, _ needles: [String]) -> String? {
+        guard let path = executablePath(pid) else { return nil }
+        var names = [(path as NSString).lastPathComponent.lowercased()]
+        let interpreters = ["node", "python", "bun", "deno", "ruby"]
+        if interpreters.contains(where: { names[0].hasPrefix($0) }) {
+            names += arguments(pid).dropFirst().prefix(2)
+                .map { ($0 as NSString).lastPathComponent.lowercased() }
+        }
+        // An entry with a slash is a path fragment, as every entry was in 0.10: match it
+        // against the whole path. Bare names match names only, or "gemini" matched
+        // Google's own app through its bundle path.
+        let full = path.lowercased()
+        return needles.first { n in n.contains("/") ? full.contains(n) : names.contains { $0.contains(n) } }
+    }
+
+    /// A process's argv, via KERN_PROCARGS2 — readable for our own processes with no
+    /// TCC prompt. Layout: argc (Int32), the exec path, NUL padding, then argc strings.
+    nonisolated static func arguments(_ pid: pid_t) -> [String] {
+        var mib: [Int32] = [CTL_KERN, KERN_PROCARGS2, pid]
+        var size = 0
+        guard sysctl(&mib, 3, nil, &size, nil, 0) == 0, size > 4 else { return [] }
+        var buf = [UInt8](repeating: 0, count: size)
+        guard sysctl(&mib, 3, &buf, &size, nil, 0) == 0, size > 4 else { return [] }
+        let argc = Int(buf.withUnsafeBytes { $0.load(as: Int32.self) })
+        var i = 4
+        while i < size, buf[i] != 0 { i += 1 }      // exec path
+        while i < size, buf[i] == 0 { i += 1 }      // padding
+        var args: [String] = []
+        while args.count < argc, i < size {
+            var j = i
+            while j < size, buf[j] != 0 { j += 1 }
+            args.append(String(decoding: buf[i..<j], as: UTF8.self))
+            i = j + 1
+        }
+        return args
     }
 
     /// Cores busy since the previous sample. First call for a pid returns 0.
@@ -555,7 +669,10 @@ final class AgentLifecycleManager {
         }
         guard rc == 0 else { return 0 }
 
-        let cpu = info.ri_user_time &+ info.ri_system_time
+        // ri_user_time and ri_system_time are Mach ticks, not nanoseconds: 24 MHz on Apple
+        // Silicon. Dividing them by nanoseconds read every process ~41x too idle, so
+        // nothing ever crossed the busy threshold.
+        let cpu = Self.ticksToNanos(info.ri_user_time &+ info.ri_system_time)
         let now = Self.machNowNanos()
         defer { lastCPUSample[pid] = (cpu, now) }
 
@@ -593,11 +710,17 @@ final class AgentLifecycleManager {
         return String(cString: buf)
     }
 
-    nonisolated static func machNowNanos() -> UInt64 {
+    private nonisolated static let timebase: mach_timebase_info_data_t = {
         var tb = mach_timebase_info_data_t()
         mach_timebase_info(&tb)
-        return mach_absolute_time() &* UInt64(tb.numer) / UInt64(tb.denom)
+        return tb
+    }()
+
+    nonisolated static func ticksToNanos(_ t: UInt64) -> UInt64 {
+        t &* UInt64(timebase.numer) / UInt64(timebase.denom)
     }
+
+    nonisolated static func machNowNanos() -> UInt64 { ticksToNanos(mach_absolute_time()) }
 
     // No deinit: this manager lives for the whole process. The socket file is unlinked
     // at startup before bind(), so a stale one left by a crash is harmless.

@@ -28,16 +28,20 @@ enum DisplayBrightness {
             && dlsym(h, "DisplayServicesSetBrightness") != nil
     }
 
+    // The built-in panel, never CGMainDisplayID(): with the lid shut on a dock, the main
+    // display is the external monitor the user is working on.
     static func read() -> Float? {
-        guard let h = handle, let p = dlsym(h, "DisplayServicesGetBrightness") else { return nil }
+        guard let h = handle, let p = dlsym(h, "DisplayServicesGetBrightness"),
+              let id = PowerManager.builtinDisplay else { return nil }
         var v: Float = 0
-        return unsafeBitCast(p, to: GetFn.self)(CGMainDisplayID(), &v) == 0 ? v : nil
+        return unsafeBitCast(p, to: GetFn.self)(id, &v) == 0 ? v : nil
     }
 
     @discardableResult
     static func write(_ v: Float) -> Bool {
-        guard let h = handle, let p = dlsym(h, "DisplayServicesSetBrightness") else { return false }
-        return unsafeBitCast(p, to: SetFn.self)(CGMainDisplayID(), max(0, min(1, v))) == 0
+        guard let h = handle, let p = dlsym(h, "DisplayServicesSetBrightness"),
+              let id = PowerManager.builtinDisplay else { return false }
+        return unsafeBitCast(p, to: SetFn.self)(id, max(0, min(1, v))) == 0
     }
 
     /// True while we are holding the panel dark.
@@ -50,7 +54,10 @@ enum DisplayBrightness {
     static func dim() -> Bool {
         guard !isDimmed, let current = read(), current > 0 else { return false }
         // Write the old value BEFORE dimming, so a crash mid-call is still recoverable.
-        try? "\(current)".write(to: AppPaths.dimmedBrightness, atomically: true, encoding: .utf8)
+        // No record, no dimming: nothing could restore the panel afterwards.
+        do {
+            try "\(current)".write(to: AppPaths.dimmedBrightness, atomically: true, encoding: .utf8)
+        } catch { return false }
         guard write(0) else {
             try? FileManager.default.removeItem(at: AppPaths.dimmedBrightness)
             return false
@@ -64,8 +71,10 @@ enum DisplayBrightness {
         guard let text = try? String(contentsOf: AppPaths.dimmedBrightness, encoding: .utf8),
               let v = Float(text.trimmingCharacters(in: .whitespacesAndNewlines))
         else { return false }
-        let ok = write(v)
+        // The record goes only once the value is back; if the panel is offline right now
+        // it is retried on the next lid open or launch.
+        guard write(v) else { return false }
         try? FileManager.default.removeItem(at: AppPaths.dimmedBrightness)
-        return ok
+        return true
     }
 }

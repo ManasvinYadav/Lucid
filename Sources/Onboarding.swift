@@ -63,37 +63,39 @@ enum HookInstaller {
         Bundle.main.resourceURL?.appendingPathComponent("hooks/install-hooks.sh")
     }
 
-    static var claudeSettings: URL {
-        FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".claude/settings.json")
+    /// Agents on this Mac that Lucid can hook.
+    static var detected: [AgentDefinition] {
+        AgentRegistry.all.filter { $0.detected && !$0.isManual }
     }
 
-    static var isInstalled: Bool {
-        guard let s = try? String(contentsOf: claudeSettings, encoding: .utf8) else { return false }
-        return s.contains("lucid-notify")
-    }
+    static var anyInstalled: Bool { AgentRegistry.all.contains(where: \.installed) }
 
-    static var claudeCodeDetected: Bool {
-        FileManager.default.fileExists(atPath: claudeSettings.deletingLastPathComponent().path)
+    /// Every hook calls ~/.lucid/lucid-notify, so an app update has to bring it along, or
+    /// agents keep running the old client until their hooks are reinstalled. Renamed
+    /// into place, so a hook firing mid-update never runs a half-written file.
+    static func syncClient() {
+        guard let src = Bundle.main.resourceURL?.appendingPathComponent("hooks/lucid-notify"),
+              let new = try? Data(contentsOf: src) else { return }
+        let dst = AppPaths.dir.appendingPathComponent("lucid-notify")
+        guard (try? Data(contentsOf: dst)) != new else { return }
+        let tmp = dst.appendingPathExtension("new")
+        guard (try? new.write(to: tmp)) != nil, chmod(tmp.path, 0o755) == 0,
+              rename(tmp.path, dst.path) == 0 else {
+            try? FileManager.default.removeItem(at: tmp)
+            return
+        }
     }
 
     @discardableResult
-    static func run(agent: String = "claude-code", _ mode: String) -> (ok: Bool, output: String) {
+    static func run(agent: String, _ mode: String) -> (ok: Bool, output: String) {
         guard let script = scriptURL,
               FileManager.default.fileExists(atPath: script.path) else {
             return (false, "Installer not found in the app bundle.")
         }
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/bin/bash")
-        p.arguments = [script.path, agent, mode]
-        let pipe = Pipe()
-        p.standardOutput = pipe
-        p.standardError = pipe
-        do { try p.run() } catch { return (false, error.localizedDescription) }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        p.waitUntilExit()
-        return (p.terminationStatus == 0,
-                String(data: data, encoding: .utf8) ?? "")
+        // Not waitUntilExit: it spins the main run loop, letting queued work run mid-call.
+        let r = PowerManager.runTool("/bin/bash", [script.path, agent, mode],
+                                     timeout: 30, mergeStderr: true)
+        return (r.ok, r.out)
     }
 }
 
@@ -103,9 +105,10 @@ struct OnboardingView: View {
     @Bindable var state: AppState
     var onFinish: () -> Void
 
-    @State private var hooksInstalled = HookInstaller.isInstalled
+    @State private var hooksInstalled = HookInstaller.anyInstalled
     @State private var hookOutput = ""
     @State private var loginItem = LoginItem.isEnabled
+    @State private var adminPending = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -167,20 +170,20 @@ struct OnboardingView: View {
 
             HStack {
                 Button(state.privilegeRuleInstalled ? "Reinstall" : "Install…") {
-                    state.power.installPrivilegeRule()
-                    state.refreshPrivilegeRule()
+                    runAdmin { _ = await state.power.installPrivilegeRule() }
                 }
                 .buttonStyle(.borderedProminent)
                 if state.privilegeRuleInstalled {
                     Button("Remove") {
-                        state.power.removePrivilegeRule()
-                        state.refreshPrivilegeRule()
+                        runAdmin { _ = await state.power.removePrivilegeRule() }
                     }
                 }
                 Spacer()
+                if adminPending { ProgressView().controlSize(.small) }
                 Text("Asks for your password once")
                     .font(.caption2).foregroundStyle(.secondary)
             }
+            .disabled(adminPending)
         }
     }
 
@@ -192,30 +195,34 @@ struct OnboardingView: View {
             done: hooksInstalled,
             required: false
         ) {
-            if HookInstaller.claudeCodeDetected {
+            let found = HookInstaller.detected
+            if found.isEmpty {
+                Text("No supported agent found. Settings → Agents lists them, with a wrapper for anything else.")
+                    .font(.caption).foregroundStyle(.orange)
+            } else {
                 Text("""
-                     Claude Code detected. These hooks report when a turn starts and when \
-                     it is waiting for input — the difference between "working" and "idle".
+                     Found: \(found.map(\.name).joined(separator: ", ")). Hooks report when a \
+                     turn starts and when the agent is waiting for input — the difference \
+                     between "working" and "idle".
 
-                     Existing hooks are preserved; the file is backed up first.
+                     Existing hooks are preserved; changed files are backed up first.
                      """)
                     .font(.caption).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
-            } else {
-                Text("Claude Code not found at ~/.claude. See the README for other agents.")
-                    .font(.caption).foregroundStyle(.orange)
             }
 
             HStack {
-                Button("Preview") { runHooks("preview") }
-                Button(hooksInstalled ? "Reinstall" : "Install Hooks") { runHooks("--apply") }
+                Button("Preview") { runHooks("preview", found) }
+                Button(hooksInstalled ? "Reinstall" : "Install Hooks") { runHooks("--apply", found) }
                     .buttonStyle(.borderedProminent)
-                    .disabled(!HookInstaller.claudeCodeDetected)
                 if hooksInstalled {
-                    Button("Remove") { runHooks("--uninstall") }
+                    Button("Remove") {
+                        runHooks("--uninstall", AgentRegistry.all.filter { $0.installed || $0.outdated })
+                    }
                 }
                 Spacer()
             }
+            .disabled(found.isEmpty)
 
             if !hookOutput.isEmpty {
                 ScrollView {
@@ -230,10 +237,17 @@ struct OnboardingView: View {
         }
     }
 
-    private func runHooks(_ mode: String) {
-        let r = HookInstaller.run(mode)
-        hookOutput = r.output.trimmingCharacters(in: .whitespacesAndNewlines)
-        hooksInstalled = HookInstaller.isInstalled
+    private func runAdmin(_ op: @escaping () async -> Void) {
+        adminPending = true
+        Task { await op(); adminPending = false }
+    }
+
+    private func runHooks(_ mode: String, _ agents: [AgentDefinition]) {
+        hookOutput = agents.map { agent in
+            let r = HookInstaller.run(agent: agent.id, mode)
+            return "\(agent.name): " + r.output.trimmingCharacters(in: .whitespacesAndNewlines)
+        }.joined(separator: "\n\n")
+        hooksInstalled = HookInstaller.anyInstalled
     }
 
     // Step 3 ---------------------------------------------------------------
@@ -241,7 +255,12 @@ struct OnboardingView: View {
         StepCard(number: 3, title: "Start automatically", done: loginItem, required: false) {
             Toggle("Launch Lucid at login", isOn: Binding(
                 get: { loginItem },
-                set: { loginItem = $0; LoginItem.setEnabled($0); state.refreshLoginItem() }))
+                set: {
+                    LoginItem.setEnabled($0)
+                    state.refreshLoginItem()
+                    loginItem = LoginItem.isEnabled   // what happened, not what was asked
+                }))
+                .disabled(LoginItem.blockedReason != nil)
                 .toggleStyle(.checkbox)
             Text("It runs in the menu bar with no Dock icon.")
                 .font(.caption).foregroundStyle(.secondary)

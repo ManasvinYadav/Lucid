@@ -8,6 +8,7 @@ import Foundation
 /// history rows. Any notification fired at a closed laptop was also never seen.
 struct AwayReport {
     let closedFor: TimeInterval
+    /// Agent turns that ended while the lid was shut. One session can finish many.
     let finished: [SessionRecord]
     let stillWorking: [String]
     let guardrailTripped: String?
@@ -27,8 +28,8 @@ struct AwayReport {
         if let g = guardrailTripped { return g }
         if !finished.isEmpty && stillWorking.isEmpty {
             return finished.count == 1
-                ? "1 session finished while you were away"
-                : "\(finished.count) sessions finished while you were away"
+                ? "1 agent turn finished while you were away"
+                : "\(finished.count) agent turns finished while you were away"
         }
         if !stillWorking.isEmpty {
             return stillWorking.count == 1
@@ -43,16 +44,21 @@ struct AwayReport {
     static func build(closedSince: Date, state: AppState) -> AwayReport {
         let closedFor = Date().timeIntervalSince(closedSince)
         let finished = SessionHistory.shared.records.filter { $0.ended >= closedSince }
-        let spent = finished.compactMap(\.batterySpent).reduce(0, +)
+        // One reading across the whole window. Summing each session's drain counted the
+        // same battery once per concurrent session.
+        let g = state.guardrails
+        let spent = state.lidClosedBattery.map { g.onACPower ? 0 : $0 - g.batteryPercent } ?? 0
         return AwayReport(
             closedFor: closedFor,
             finished: finished,
             stillWorking: state.lifecycle.sessions.filter(\.isWorking).map(\.displayName),
-            guardrailTripped: state.guardrails.yieldReason?.summary,
+            // What tripped during the close, never what is live now: Low Power Mode left
+            // on before the lid shut is not news, and opening the lid ends the lid cap.
+            guardrailTripped: state.awayTrips.last,
             batterySpent: spent > 0 ? spent : nil,
-            sleptWhileArmed: state.power.sleepHistory.contains {
-                $0.at >= closedSince && $0.wasArmed
-            },
+            // PowerManager's verdict, not every armed sleep: with the lid shut and no
+            // SleepDisabled (no rule, or coverage off), sleeping is what was promised.
+            sleptWhileArmed: state.power.lastFailedSleep.map { $0 >= closedSince } ?? false,
             panelLitSeconds: state.power.displayLitSeconds)
     }
 }

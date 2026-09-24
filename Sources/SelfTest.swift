@@ -8,7 +8,8 @@ import IOKit.pwr_mgt
 /// anything else.
 enum SelfTest {
 
-    static func run() {
+    /// True when every asserted check passed; `--selftest` exits non-zero otherwise.
+    static func run() -> Bool {
         var failures: [String] = []
         func check(_ label: String, _ value: String, ok: Bool = true, note: String = "") {
             let mark = ok ? "ok  " : "FAIL"
@@ -68,17 +69,26 @@ enum SelfTest {
 
         // --- Privileged layer ---------------------------------------------------
         print("\nLid-close support")
+        // Only required when lid-close coverage is wanted; without it the rule is unused.
         let installed = PowerManager.isPrivilegeRuleInstalled()
-        check("privilege rule", installed ? "installed" : "NOT installed", ok: installed,
-              note: installed ? "" : "-> Settings > Privileges")
+        let wanted = Preferences.shared.lidCloseCoverage
+        check("privilege rule",
+              installed ? "installed" : wanted ? "NOT installed" : "not installed (lid-close coverage off)",
+              ok: installed || !wanted,
+              note: installed || !wanted ? "" : "-> Settings > Privileges")
+        // A flag the user set is theirs, so it is reported rather than failed. Lucid's own
+        // leftovers are caught by the arm-marker check below.
+        let live = probeSocket()
         let sd = PowerManager.readSleepDisabled()
         check("SleepDisabled", sd.map { $0 ? "1 (engaged)" : "0" } ?? "unreadable",
-              ok: sd != nil)
+              ok: sd != nil,
+              note: sd == true && !live
+                  ? "-> Lucid is not running, so this was set outside it. If not by you: sudo pmset -a disablesleep 0"
+                  : "")
         check("launch at login", LoginItem.isEnabled ? "enabled" : "disabled")
         // The marker only means an unclean shutdown if nobody is home. A live, armed
         // app is supposed to have one.
         let marker = FileManager.default.fileExists(atPath: AppPaths.armMarker.path)
-        let live = probeSocket()
         check("arm marker",
               !marker ? "clean"
                       : live ? "present (app is running and armed)"
@@ -90,10 +100,11 @@ enum SelfTest {
         // sequence. SleepDisabled vetoes that sequence, so the panel can stay lit inside
         // a shut lid unless the app blanks it explicitly.
         print("\nDisplay")
+        check("built-in panel", PowerManager.builtinDisplay.map { "display \($0)" } ?? "none online")
         check("panel asleep", PowerManager.displayIsAsleep ? "yes" : "no")
-        let displays = PowerManager.activeDisplayCount
-        check("active displays", "\(displays)",
-              note: displays > 1 ? "external attached — blanking is left to macOS" : "")
+        let externals = PowerManager.externalDisplayCount
+        check("external displays", "\(externals)",
+              note: externals > 0 ? "attached — blanking is left to macOS" : "")
         let holders = PowerManager.displayHolders()
         check("holding the panel lit",
               holders.isEmpty ? "nothing"
@@ -116,12 +127,13 @@ enum SelfTest {
         let mine = procs.filter { $0.uid == getuid() }
         check("own-uid processes", "\(mine.count)", note: "(rusage is EPERM beyond these)")
 
-        let needles = Preferences.shared.processWhitelist.map { $0.lowercased() }
+        // The same matcher the scanner uses, so this shows what it would track.
+        let needles = Preferences.shared.processWhitelist.map { $0.lowercased() }.filter { !$0.isEmpty }
         var matched: [String] = []
         for p in mine {
-            guard let path = AgentLifecycleManager.executablePath(p.pid)?.lowercased(),
-                  needles.contains(where: { path.contains($0) }) else { continue }
-            matched.append("\(p.pid) \((path as NSString).lastPathComponent)")
+            guard let n = AgentLifecycleManager.matchedNeedle(p.pid, needles) else { continue }
+            let name = (AgentLifecycleManager.executablePath(p.pid) as NSString?)?.lastPathComponent ?? "?"
+            matched.append("\(p.pid) \(name) (\(n))")
         }
         check("whitelist matches", matched.isEmpty ? "none" : matched.joined(separator: ", "))
 
@@ -250,8 +262,8 @@ enum SelfTest {
             let done = AwayReport(closedFor: 3600, finished: [rec], stillWorking: [],
                                   guardrailTripped: nil, batterySpent: 8,
                                   sleptWhileArmed: false, panelLitSeconds: 0)
-            check("away: reports a finished session", done.headline,
-                  ok: done.isWorthShowing && done.headline.contains("1 session finished"))
+            check("away: reports a finished turn", done.headline,
+                  ok: done.isWorthShowing && done.headline.contains("1 agent turn finished"))
 
             let failed = AwayReport(closedFor: 3600, finished: [], stillWorking: [],
                                     guardrailTripped: nil, batterySpent: nil,
@@ -259,10 +271,51 @@ enum SelfTest {
             check("away: a sleep while armed outranks everything", failed.headline,
                   ok: failed.isWorthShowing && failed.headline.contains("slept"))
 
-            let h = SessionHistory.shared
-            let before = h.awakeToday
-            check("history: today's awake time", before.compactDuration)
-            check("history: records on disk", "\(h.records.count)")
+            // History rollups: overlapping sessions are one stretch of time, and a
+            // session that began before the cut-off only counts from it.
+            let t0 = Date(timeIntervalSince1970: 1_000_000)
+            func r(_ a: Double, _ b: Double, _ bs: Int? = nil, _ be: Int? = nil) -> SessionRecord {
+                SessionRecord(agent: "a", started: t0.addingTimeInterval(a * 60),
+                              ended: t0.addingTimeInterval(b * 60), reason: "r",
+                              batteryStart: bs, batteryEnd: be, wasOnAC: bs == nil ? nil : false)
+            }
+            let overlap = [r(0, 10), r(5, 20), r(30, 40)]
+            let worked = SessionHistory.workingTime(overlap, since: .distantPast) / 60
+            check("history: overlaps merged", "\(Int(worked)) min", ok: worked == 30)
+            let clipped = SessionHistory.workingTime(overlap, since: t0.addingTimeInterval(15 * 60)) / 60
+            check("history: clipped to the cut-off", "\(Int(clipped)) min", ok: clipped == 15)
+            let drain = SessionHistory.batterySpent([r(0, 10, 60, 52), r(5, 20, 58, 50)],
+                                                    since: .distantPast)
+            check("history: battery counted once per span", "\(drain?.points ?? -1) points",
+                  ok: drain?.points == 10)
+
+            // Whitelist migration, on a throwaway defaults domain.
+            let suite = "com.lucid.selftest"
+            if let d = UserDefaults(suiteName: suite) {
+                d.set(["aider", "gemini", "mine"], forKey: "processWhitelist")
+                let v0 = Preferences.migratedWhitelist(d)
+                check("whitelist: v0 gains defaults, loses gemini", v0.joined(separator: ","),
+                      ok: v0.contains("ollama") && !v0.contains("gemini") && v0.contains("mine"))
+                d.set(["aider", "copilot"], forKey: "processWhitelist")
+                d.set(1, forKey: "whitelistVersion")
+                let v1 = Preferences.migratedWhitelist(d)
+                check("whitelist: v1 keeps removals, loses copilot", v1.joined(separator: ","),
+                      ok: v1 == ["aider"])
+                let v2 = Preferences.migratedWhitelist(d)
+                check("whitelist: runs once", v2.joined(separator: ","), ok: v2 == ["aider"])
+                // 0.10 stored version 1 with its own defaults; codeium matched by path then.
+                d.set(["cline", "codeium", "ollama"], forKey: "processWhitelist")
+                d.set(1, forKey: "whitelistVersion")
+                let v10 = Preferences.migratedWhitelist(d)
+                check("whitelist: 0.10's codeium becomes .codeium/", v10.joined(separator: ","),
+                      ok: v10 == ["cline", ".codeium/", "ollama"])
+                d.removePersistentDomain(forName: suite)
+                try? FileManager.default.removeItem(at: FileManager.default
+                    .homeDirectoryForCurrentUser
+                    .appendingPathComponent("Library/Preferences/\(suite).plist"))
+            }
+
+            check("history: records on disk", "\(SessionHistory.shared.records.count)")
         }
 
         print("")
@@ -271,6 +324,7 @@ enum SelfTest {
         } else {
             print("\(failures.count) check(s) failed: \(failures.joined(separator: ", "))")
         }
+        return failures.isEmpty
     }
 }
 

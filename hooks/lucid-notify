@@ -1,24 +1,97 @@
 #!/bin/sh
-# Lucid hook client.  usage: lucid-notify <agent> <working|idle|ended> [detail]
+# Lucid hook client.
+#   lucid-notify [--stdin] <agent> <working|idle|ended> [detail]
 #
-# Must never block, never fail the calling agent, and never write to its stdout.
+# --stdin  the agent pipes its hook payload (JSON) to us; take the session id from it.
+#          Only the installer passes this, for agents known to close stdin; a wrapper
+#          script never does, or it would swallow input meant for the agent.
+#
+# Must never stall or fail the calling agent, and never write to its stdout.
 # Always exits 0.
 SOCK="$HOME/.lucid/agent.sock"
 [ -S "$SOCK" ] || exit 0
 
+IN=""
+if [ "${1:-}" = "--stdin" ]; then
+  shift
+  if [ ! -t 0 ]; then
+    # Bounded twice over: 64 KB, and one second in case the agent never closes stdin.
+    # fd 3 because a background job in a script gets /dev/null as stdin otherwise.
+    exec 3<&0
+    IN=$(head -c 65536 <&3 2>/dev/null & r=$!
+         (sleep 1; kill "$r") >/dev/null 2>&1 &
+         wait "$r" 2>/dev/null)
+    exec 3<&-
+  fi
+fi
+
 AGENT="${1:-unknown}"
-STATUS="${2:-idle}"
+STATUS="${2:-}"
 DETAIL="${3:-}"
+case "$STATUS" in working|idle|ended) ;; *) exit 0 ;; esac
 
-# Prefer the session id the agent gives us; fall back to the parent pid so that
-# concurrent sessions from the same agent stay distinct.
-SID="${CLAUDE_SESSION_ID:-${CODEX_SESSION_ID:-${LUCID_SESSION_ID:-$PPID}}}"
+# Session id: the agent's own, from its payload or environment. Only then our pid
+# fallback, which keeps concurrent sessions of one agent apart. Payloads name it
+# session_id (Claude Code, Codex, Droid, Qwen, Devin), sessionId (Copilot),
+# conversation_id (Cursor), taskId (Cline) or trajectory_id (Windsurf).
+field() {
+  printf '%s' "$IN" \
+    | grep -oE "\"($1)\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" 2>/dev/null | head -n 1 \
+    | sed 's/.*"\([^"]*\)"$/\1/'
+}
+# Cursor and Devin run Claude Code's hooks as well. Report those under the agent that
+# actually ran them: with Cursor's own hooks also installed they then share its
+# conversation id and show as one session, not a phantom Claude Code one. CLAUDECODE is
+# set in every process Claude Code itself runs, including Claude inside those apps.
+if [ "$AGENT" = claude-code ] && [ -z "${CLAUDECODE:-}" ]; then
+  if [ -n "${CURSOR_VERSION:-}" ] || printf '%s' "$IN" | grep -q '"cursor_version"'; then
+    AGENT=cursor
+  elif [ -n "${DEVIN_PROJECT_DIR:-}" ]; then
+    AGENT=devin
+  fi
+fi
 
-# PPID is the agent process itself. Reporting it lets the app watch for that pid
-# exiting and drop the session instantly, instead of waiting out the stale-session
-# timeout when an agent is killed mid-turn.
+# The agent's own name for it first: a tool's input can hold a nested "session_id" of its
+# own. Cursor's session_id comes after the tool input; conversation_id comes first and is
+# the same value. Cline calls it taskId, Windsurf trajectory_id.
+case "$AGENT" in
+  cursor) SID=$(field 'conversation_id') ;;
+  cline) SID=$(field 'taskId') ;;
+  windsurf) SID=$(field 'trajectory_id') ;;
+  *) SID=$(field 'session_id|sessionId') ;;
+esac
+[ -n "$SID" ] || SID=$(field 'session_id|sessionId|conversation_id|taskId|trajectory_id')
+[ -n "$SID" ] || SID="${LUCID_SESSION_ID:-}"
+[ -n "$SID" ] || { [ "$AGENT" = gemini ] && SID="${GEMINI_SESSION_ID:-}"; }
+
+# The agent's pid, so the app notices the moment it exits. $PPID alone is often a
+# short-lived shell the hook runs under, and watching that reaped the session as soon as
+# the shell exited — mid-turn. Walk past shells to the process that owns them.
+agent_pid() {
+  p=$PPID; n=0
+  while [ "$p" -gt 1 ] 2>/dev/null && [ "$n" -lt 5 ]; do
+    set -- $(ps -o ppid=,comm= -p "$p" 2>/dev/null)
+    [ $# -ge 2 ] || break
+    c=${2##*/}; c=${c#-}
+    case "$c" in
+      sh|bash|zsh|dash|ksh|fish|env) p=$1; n=$((n + 1)) ;;
+      *) break ;;
+    esac
+  done
+  echo "$p"
+}
+PID="${LUCID_PID:-$(agent_pid)}"
+case "$PID" in ''|*[!0-9]*) PID=0 ;; esac
+[ -n "$SID" ] || SID="$PID"
+
+# JSON-escape: drop control characters, escape backslash and quote.
+esc() { printf '%s' "$1" | tr -d '\000-\037' | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+
+# Foreground, with a bound: each event lands before the agent moves on, so a `working`
+# and the `idle` right behind it can no longer arrive in the wrong order. The app closes
+# the connection after one line, so this normally takes milliseconds.
 printf '{"agent":"%s","session_id":"%s","status":"%s","detail":"%s","pid":%s}\n' \
-    "$AGENT" "$SID" "$STATUS" "$DETAIL" "$PPID" \
-  | /usr/bin/nc -U "$SOCK" >/dev/null 2>&1 &
+    "$(esc "$AGENT")" "$(esc "$SID")" "$STATUS" "$(esc "$DETAIL")" "$PID" \
+  | /usr/bin/nc -U -w 1 "$SOCK" >/dev/null 2>&1
 
 exit 0

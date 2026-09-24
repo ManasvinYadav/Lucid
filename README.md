@@ -89,12 +89,18 @@ defeated by any network-bound tool call. That gap is the only comparative claim 
 Three layers, deliberately separate because they differ in privilege and blast radius.
 
 1. **A power assertion** (`PreventUserIdleSystemSleep`) — unprivileged, always held while
-   armed. Stops idle sleep. On many Apple Silicon Macs this alone survives a lid close.
-2. **The `SleepDisabled` flag** — root-gated, and only used if layer 1 is not enough on your
-   machine. The Diagnostics tab tells you which one this Mac needs.
-3. **Guardrails** — battery, AC, Low Power Mode and thermal, any of which release everything.
+   armed. Stops idle sleep with the lid open.
+2. **The `SleepDisabled` flag** — root-gated, and what actually survives a lid close (see
+   below). The lid test under Diagnostics closes the lid for real and reports which layer
+   this Mac needs.
+3. **Guardrails** — battery, AC, Low Power Mode, thermal and a lid-closed time cap, any of
+   which release everything.
 
 Display sleep is never asserted, so the panel still goes dark when you shut the lid.
+
+When the work finishes with the lid shut, Lucid puts the Mac to sleep itself. macOS decides
+clamshell sleep only at the moment the lid closes, so clearing the flag alone would leave it
+awake until you next open it.
 
 ### Why a power assertion is not enough on its own
 
@@ -118,76 +124,146 @@ A setup window opens the first time you launch, covering the three things that c
 silently:
 
 1. **Lid-close support** — installs the sudoers rule (one password prompt)
-2. **Agent hooks** — previews the change, then merges into `~/.claude/settings.json`
+2. **Agent hooks** — for every supported agent it finds, previews the change, then merges it in
 3. **Launch at login** — writes a LaunchAgent
 
 Every step also lives permanently in Settings, under Privileges, Agents and General.
 
 ## Hooks
 
+Install them from **Settings → Agents**, or from a terminal with the copy inside the app
+(in a source checkout it is `./hooks/install-hooks.sh`):
+
 ```bash
-./hooks/install-hooks.sh            # preview, writes nothing
-./hooks/install-hooks.sh --apply    # merge into ~/.claude/settings.json (backs up first)
-./hooks/install-hooks.sh --uninstall
+H=/Applications/Lucid.app/Contents/Resources/hooks/install-hooks.sh
+"$H" --list               # supported, detected, installed
+"$H" codex                # preview as a diff, changes no agent config
+"$H" codex --apply        # merge in (changed files are backed up first)
+"$H" codex --uninstall    # take Lucid's entries out again
 ```
 
-Merges into your existing hooks rather than replacing them, and is idempotent.
+The agent defaults to `claude-code`. The installer merges into the hooks you already have,
+never replaces them, and running it twice changes nothing. It refuses to touch a file it
+cannot parse, including JSON with comments, rather than guess.
+
+| Agent | How | Written to | |
+|---|---|---|---|
+| Claude Code | hooks | `~/.claude/settings.json` | verified |
+| Codex CLI | hooks | `~/.codex/hooks.json` | verified |
+| Gemini CLI | hooks | `~/.gemini/settings.json` | verified |
+| Cursor | hooks | `~/.cursor/hooks.json` | best-effort |
+| Copilot CLI | hooks | `~/.copilot/hooks/lucid.json` (its own file) | best-effort |
+| Factory Droid | hooks | `~/.factory/hooks.json` | best-effort |
+| Qwen Code | hooks | `~/.qwen/settings.json` | best-effort |
+| Cline | hook scripts | `~/Documents/Cline/Hooks/` (one file per hook) | best-effort |
+| Devin | hooks | `~/.config/devin/config.json` | best-effort |
+| opencode | plugin | `~/.config/opencode/plugins/lucid.js` | best-effort |
+| Amp | plugin | `~/.config/amp/plugins/lucid.ts` | best-effort |
+| Aider | wrapper script | — | no hooks |
+| Windsurf | process activity | — | see below |
+
+**Verified** means the event names and file format were checked against a real install
+(Claude Code 2.1, Codex 0.150, Gemini CLI 0.56). **Best-effort** means built from the tool's
+documentation but not yet run against it. If one misbehaves, an issue with the tool's
+version is very welcome.
+
+Per-agent notes:
+
+- **Codex** skips new hooks until you trust them. Run `/hooks` in Codex once after installing.
+- **Gemini CLI** runs hooks only in trusted folders, and only in sessions started afterwards.
+- **Cursor** has no hook for "waiting for approval", so a Cursor chat reads as working
+  while an approval prompt is open. It also runs Claude Code's hooks; Lucid reports those as
+  Cursor, so they do not show up as a phantom Claude Code session.
+- **Qwen Code** reads hooks when a session starts, so restart any open session.
+- **Cline** (the VS Code extension and the CLI) keeps hooks in `~/Documents`, so macOS
+  asks once for Documents access. Lucid only looks there once it finds Cline itself. Like
+  Cursor, Cline has no hook for waiting on approval, and it has no session-end hook: a
+  finished task leaves the list when the next one starts, or when Cline exits. Cline runs
+  one script per hook, so Lucid will not install over a script of your own there; move it
+  aside first.
+- **Devin** covers Devin CLI and Devin Local in Devin Desktop. Devin can also run the
+  Claude Code hooks in `~/.claude/settings.json`; Lucid reports those as Devin, not as a
+  phantom Claude Code session.
+- **Windsurf** gets no hooks from Lucid. Its Cascade agent had them, but with no event for
+  a cancelled turn a session could stay "working" and keep the Mac awake, and Devin Desktop
+  3.9.19 removed Cascade anyway. Use the Devin entry for Devin Local; Cascade falls back to
+  process activity.
+- **opencode** and **Amp** load plugins at startup, so restart them (or run Amp's
+  `plugins: reload`).
+- Lucid 0.10 wrote Codex hooks to `config.toml` and opencode hooks to `config.json`, and
+  neither tool reads those. Settings → Agents marks these **Outdated**, and installing
+  again removes them.
 
 | Claude Code event | Sent | Why |
 |---|---|---|
+| `SessionStart` | `idle` | The session exists and is waiting for a prompt |
 | `UserPromptSubmit` | `working` | Turn begins |
 | `PreToolUse` / `PostToolUse` / `PostToolUseFailure` | `working` | Doubles as a heartbeat for long tool runs |
 | `SubagentStart` / `SubagentStop` | `working` | Background agents count as work |
-| `Notification` | `idle` | Fires when Claude Code is waiting for input |
-| `Stop` | `idle` | Turn complete |
+| `Notification` | `idle` | Only permission, idle and elicitation prompts: Claude Code is waiting for you |
+| `Stop` / `StopFailure` | `idle` | Turn complete, or ended on an API error |
 | `SessionEnd` | `ended` | Reap the session |
 
-### Other agents
+The other agents map their own events the same way. `install-hooks.sh <agent>` shows the
+exact entries before anything is written.
+
+### Anything else
 
 The wire protocol is one line of JSON to `~/.lucid/agent.sock`, a Unix domain socket at mode
 0600 inside a 0700 directory — not a loopback TCP port, which any process or web page could
 reach.
 
 ```json
-{"agent":"codex","session_id":"abc","status":"working","detail":"Tool Running"}
+{"agent":"my-agent","session_id":"abc","status":"working","detail":"Tool Running","pid":4242}
 ```
 
-`status` is `working` | `idle` | `ended`. Use the bundled client:
+`status` is `working` | `idle` | `ended`. `pid` is the agent's process: while it runs, a
+session that has gone quiet is kept; without it, a `working` session with no event for the
+TTL (5 min) is dropped, even mid-task. Use the bundled client, which sends it:
 
 ```sh
-~/.lucid/lucid-notify <agent> <working|idle|ended> [detail]
+~/.lucid/lucid-notify [--stdin] <agent> <working|idle|ended> [detail]
 ```
 
-It never blocks, never fails the calling agent, and always exits 0.
+With `--stdin` it reads the hook's JSON payload for the agent's own session id. It waits at
+most a second for the payload and a second for the app, never fails the calling agent, and
+always exits 0.
 
-**Codex CLI** — in `~/.codex/config.toml`:
-```toml
-[hooks]
-pre_turn  = '~/.lucid/lucid-notify codex working "Turn"'
-post_turn = '~/.lucid/lucid-notify codex idle "Waiting for prompt"'
-```
+**A CLI with no hooks** — wrap it. This reports `working` for as long as the process runs,
+so it cannot tell working from waiting at a prompt:
 
-**Any CLI without a hook system** — wrap it:
 ```sh
 #!/bin/sh
-export LUCID_SESSION_ID=$$
-~/.lucid/lucid-notify "$AGENT" working "Running"
-trap '~/.lucid/lucid-notify "$AGENT" ended' EXIT
-exec real-agent-binary "$@"
+export LUCID_SESSION_ID="wrap-$$" LUCID_PID=$$
+"$HOME/.lucid/lucid-notify" my-agent working "Running"
+real-agent-binary "$@"
+rc=$?
+"$HOME/.lucid/lucid-notify" my-agent ended
+exit $rc
 ```
 
-**GUI tools with no hooks** (Cursor, Cline) fall back to process activity, and are badged
-`Process` in the menu so an inferred state is never mistaken for a reported one.
+**GUI tools with no hooks** (Windsurf, or Cursor and the Cline CLI before their hooks are
+installed) fall back to process activity, badged `Process` in the menu so an inferred state
+is never mistaken for a reported one. Once an agent's hooks are installed, Lucid stops
+guessing from its processes. The Cline VS Code extension runs inside VS Code's own helper
+process, so only its hooks can report it. The list lives in Settings → Agents: an entry
+matches a process name, or, if it contains a `/`, a fragment of the full path.
 
 ## Guardrails
 
-All public API, entitlement-free, event-driven — no polling.
+All public API, entitlement-free. Battery, AC, Low Power Mode and thermal changes arrive as
+events; the lid is read every 5 s and the lid-closed cap checked every 30 s.
 
-- **Battery floor** (10–50% slider) — releases below the threshold on battery
+- **Battery floor** (10–50% slider) — releases below the threshold unless the battery is
+  actually charging: on battery, or on a charger too weak to keep up
 - **AC-only mode** — only hold awake while plugged in
 - **Low Power Mode** — yields immediately when it turns on
-- **Thermal** — yields on `.critical`, and on `.serious` while the lid is shut
-- **Lid-closed cap** — an optional ceiling on how long the lock may hold with the lid shut
+- **Thermal** — yields on `.critical`, and on `.serious` while the lid is shut with no
+  external display
+- **Lid-closed cap** — on by default at 2 hours (Settings → Power → Time limit, 15 min to
+  8 h, or off): how long the lock may hold with the lid shut and no external display, after
+  which it is released and the Mac goes to sleep. The clock starts when the lid shuts, or
+  when the last display is unplugged with it shut
 
 There is deliberately **no °C threshold**. Apple Silicon runs 70–100 °C by design and
 self-throttles in hardware, and die temperature does not track the thermal pressure macOS

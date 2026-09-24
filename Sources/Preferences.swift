@@ -71,9 +71,15 @@ final class Preferences {
     var processFallbackEnabled: Bool {
         didSet { d.set(processFallbackEnabled, forKey: "processFallbackEnabled") }
     }
-    /// Matched as case-insensitive substrings against the full executable path.
+    /// Case-insensitive substrings of the process name (for an interpreter, of the script
+    /// it runs too).
     var processWhitelist: [String] {
-        didSet { d.set(processWhitelist, forKey: "processWhitelist") }
+        didSet {
+            d.set(processWhitelist, forKey: "processWhitelist")
+            // Without this a fresh install's first edit was saved as version 0, and the
+            // next launch re-added every default the user had just removed.
+            d.set(Preferences.whitelistVersion, forKey: "whitelistVersion")
+        }
     }
     /// Cores-busy threshold above which a fallback process counts as active.
     var processCPUThreshold: Double {
@@ -94,21 +100,29 @@ final class Preferences {
 
     /// Agents with no usable lifecycle hooks, covered by process activity instead.
     static let defaultWhitelist = [
-        "Cursor Helper", "cline", "windsurf", "codeium", "continue",
-        "aider", "gemini", "copilot",
+        "Cursor Helper", "cline", "windsurf", ".codeium/", "continue", "aider",
         "llama-server", "ollama", "mlx", "comfy",
     ]
+    static let whitelistVersion = 2
 
     /// Existing installs have the whitelist frozen at the defaults of whichever version
-    /// first wrote it. Fold in entries added since, once, without touching anything the
-    /// user removed or added themselves after that point.
-    private static func migratedWhitelist(_ d: UserDefaults) -> [String] {
+    /// first wrote it. Bring it forward once, without touching anything the user removed
+    /// or added themselves after that point.
+    static func migratedWhitelist(_ d: UserDefaults) -> [String] {
         guard var stored = d.stringArray(forKey: "processWhitelist") else { return defaultWhitelist }
-        let version = 1
-        guard d.integer(forKey: "whitelistVersion") < version else { return stored }
-        stored.append(contentsOf: defaultWhitelist.filter { !stored.contains($0) })
+        let from = d.integer(forKey: "whitelistVersion")
+        guard from < whitelistVersion else { return stored }
+        if from < 1 { stored.append(contentsOf: defaultWhitelist.filter { !stored.contains($0) }) }
+        // 2: Gemini CLI and Copilot CLI have hooks now, and the bare names also matched
+        // Google's Gemini app and Microsoft's Copilot app. Names now match names only, and
+        // Codeium's language server is not named codeium: ".codeium/" replaces it, in place.
+        // 0.10 stored version 1, so the defaults above are not folded in again.
+        if let i = stored.firstIndex(of: "codeium") {
+            if stored.contains(".codeium/") { stored.remove(at: i) } else { stored[i] = ".codeium/" }
+        }
+        stored.removeAll { ["gemini", "copilot"].contains($0) }
         d.set(stored, forKey: "processWhitelist")
-        d.set(version, forKey: "whitelistVersion")
+        d.set(whitelistVersion, forKey: "whitelistVersion")
         return stored
     }
 
@@ -136,13 +150,34 @@ final class Preferences {
 
 /// Everything Lucid owns lives under ~/.lucid (mode 0700).
 enum AppPaths {
-    static let dir: URL = {
+    /// Created on every access, not once: after Remove Everything deletes it, a still
+    /// running app must not go on writing into a directory that is gone. Tightened to
+    /// 0700 every time too, because something else (an older install script) may have
+    /// created it first under the default umask.
+    static var dir: URL {
+        #if DEBUG_RENDER
+        // Screenshots only: never take over a live instance's socket, lock or marker.
+        let u = FileManager.default.temporaryDirectory.appendingPathComponent("lucid-render")
+        #else
         let u = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".lucid")
-        try? FileManager.default.createDirectory(
-            at: u, withIntermediateDirectories: true,
-            attributes: [.posixPermissions: 0o700])
+        #endif
+        if !removed {
+            try? FileManager.default.createDirectory(at: u, withIntermediateDirectories: true)
+            chmod(u.path, 0o700)
+        }
         return u
-    }()
+    }
+
+    /// Set once Remove Everything has deleted the directory, so the teardown on the way
+    /// out does not quietly recreate it.
+    nonisolated(unsafe) static var removed = false
+
+    /// True only if the marker is really on disk. Callers must not engage SleepDisabled
+    /// without it: the marker is the only thing that undoes the flag after a kill -9.
+    static func writeArmMarker() -> Bool {
+        (try? Data().write(to: armMarker)) != nil
+    }
+    static var instanceLock: URL { dir.appendingPathComponent("instance.lock") }
     static var socket: URL { dir.appendingPathComponent("agent.sock") }
     /// Written while SleepDisabled is engaged. Its presence at launch means we crashed.
     static var armMarker: URL { dir.appendingPathComponent("armed") }
@@ -175,30 +210,37 @@ enum LoginItem {
         Bundle.main.executableURL?.path
     }
 
-    /// True only if the agent exists AND still points at a binary that is there. A plist
-    /// left behind by a translocated or since-deleted bundle would otherwise report as
-    /// enabled forever while silently failing at every login.
+    /// True only if the agent exists AND points at this copy of the app. A plist left by
+    /// a translocated, deleted or different copy would otherwise read as enabled while
+    /// login launched something else, or nothing.
     static var isEnabled: Bool {
         guard let data = try? Data(contentsOf: plistURL),
               let plist = try? PropertyListSerialization.propertyList(
                   from: data, options: [], format: nil) as? [String: Any],
               let args = plist["ProgramArguments"] as? [String], let exe = args.first
         else { return false }
-        return FileManager.default.isExecutableFile(atPath: exe)
+        return exe == executablePath && FileManager.default.isExecutableFile(atPath: exe)
     }
+
+    static var plistExists: Bool { FileManager.default.fileExists(atPath: plistURL.path) }
 
     /// Non-nil when launch at login cannot work from where the app currently is.
     static var blockedReason: String? {
         InstallLocation.isTranslocated ? InstallLocation.advice : nil
     }
 
+    /// Writes or deletes the plist and nothing else; launchd reads it at the next login.
+    ///
+    /// No `launchctl` here. Bootstrapping on enable started a second copy of the app
+    /// on the spot (RunAtLoad), and booting out on disable sent SIGTERM to this very
+    /// process whenever login had started it — quitting mid-uninstall. A deleted plist
+    /// is not loaded at the next login, and KeepAlive only restarts after a crash.
     @discardableResult
     static func setEnabled(_ on: Bool) -> Bool {
         let fm = FileManager.default
         guard on else {
-            _ = runLaunchctl(["bootout", "gui/\(getuid())/\(label)"])
             try? fm.removeItem(at: plistURL)
-            return true
+            return !plistExists
         }
 
         // Refuse to record a path that will not exist next login. A translocated bundle
@@ -222,20 +264,6 @@ enum LoginItem {
         try? fm.createDirectory(at: plistURL.deletingLastPathComponent(),
                                 withIntermediateDirectories: true)
         do { try data.write(to: plistURL, options: .atomic) } catch { return false }
-
-        // Re-register so the change takes effect without a logout.
-        _ = runLaunchctl(["bootout", "gui/\(getuid())/\(label)"])
-        return runLaunchctl(["bootstrap", "gui/\(getuid())", plistURL.path])
-    }
-
-    @discardableResult
-    private static func runLaunchctl(_ args: [String]) -> Bool {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-        p.arguments = args
-        p.standardOutput = FileHandle.nullDevice
-        p.standardError = FileHandle.nullDevice
-        do { try p.run(); p.waitUntilExit(); return p.terminationStatus == 0 }
-        catch { return false }
+        return true
     }
 }

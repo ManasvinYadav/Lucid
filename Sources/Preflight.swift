@@ -23,12 +23,13 @@ struct Preflight {
         var issues: [Issue] = []
         let prefs = Preferences.shared
 
-        if prefs.lidCloseCoverage {
-            if !PowerManager.isPrivilegeRuleInstalled() {
-                issues.append(Issue(
-                    text: "The privilege rule is gone — a system update can remove it. Lid-close coverage will fall back to the power assertion alone.",
-                    severity: .warning))
-            } else if PowerManager.readSleepDisabled() == false, state.power.isArmed {
+        // A missing rule is reported by the menu's own setup alert; re-checking here is
+        // what makes that alert current if a system update removed the rule.
+        state.power.refreshRuleInstalled()
+        // Not during a lid test, which sets the layer itself: an assertion-only test turns
+        // it off on purpose, and a SleepDisabled test aborts if it did not engage.
+        if prefs.lidCloseCoverage && state.power.ruleInstalled && !state.power.lidTestRunning {
+            if PowerManager.readSleepDisabled() == false, state.power.isArmed {
                 issues.append(Issue(
                     text: "SleepDisabled did not take effect despite the rule being installed.",
                     severity: .blocking))
@@ -38,7 +39,12 @@ struct Preflight {
         // Hooks are what make the difference between working and idle. Losing them
         // silently downgrades the app to process guessing.
         let installed = AgentRegistry.all.filter { $0.installed }
-        let detected  = AgentRegistry.all.filter { $0.detected && $0.configPath != nil }
+        let detected  = AgentRegistry.all.filter { $0.detected && !$0.isManual }
+        for agent in AgentRegistry.all where agent.outdated {
+            issues.append(Issue(
+                text: "\(agent.name) has hooks from an older Lucid that report nothing. Update them in Settings → Agents.",
+                severity: .warning))
+        }
         if installed.isEmpty && !detected.isEmpty && !prefs.processFallbackEnabled {
             issues.append(Issue(
                 text: "No agent hooks are installed and the process fallback is off, so nothing can report agent state.",

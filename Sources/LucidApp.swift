@@ -43,48 +43,66 @@ final class AppState {
     /// Set by the Pause menu items. Nil means not paused.
     private(set) var pausedUntil: Date?
     private var agentsWantLock = false
+    /// The lock is held because agents are working, not for Always or a lid test.
+    private var heldForAgents = false
     private var pauseTimer: Timer?
     private var guardrailTimer: Timer?
 
-    var privilegeRuleInstalled: Bool
+    /// PowerManager checks the rule itself (it needs the answer before any arm), so this
+    /// only forwards; a second copy here went stale whenever the rule changed.
+    var privilegeRuleInstalled: Bool { power.ruleInstalled }
 
     init() {
         mode = LockMode(rawValue: UserDefaults.standard.string(forKey: "lockMode") ?? "auto") ?? .auto
-        privilegeRuleInstalled = PowerManager.isPrivilegeRuleInstalled()
         loginItemEnabled = LoginItem.isEnabled
+        HookInstaller.syncClient()
 
         lifecycle.batteryReader = { [weak guardrails] in
             (guardrails?.batteryPercent ?? 100, guardrails?.onACPower ?? true)
         }
-        guardrails.lidIsClosed = { [weak power] in power?.lidClosed ?? false }
-        guardrails.lidClosedSince = { [weak power] in power?.lidClosedSince }
+        // Docked with the lid shut is the desk, not a bag: no cap, no lid-shut thermal rule.
+        guardrails.lidIsClosed = { [weak power] in power?.lidShutUndocked ?? false }
+        guardrails.lidClosedSince = { [weak power] in
+            power?.lidShutUndocked == true ? power?.lidClosedSince : nil
+        }
         // The lid cap is time-based, so it needs a nudge rather than an event.
         power.onLidChange = { [weak self] closed in
             guard let self else { return }
-            self.guardrails.tick()
             if closed {
-                self.lidClosedAt = Date()
                 self.awayReport = nil
-            } else if let since = self.lidClosedAt {
-                self.lidClosedAt = nil
-                let report = AwayReport.build(closedSince: since, state: self)
-                if report.isWorthShowing {
-                    self.awayReport = report
-                    self.notifications.post(.awayReport(report.headline))
-                }
+                // Docked is the desk: the user is right here, not away.
+                if !self.power.docked { self.startAway(since: Date()) }
+            } else {
+                // Before the tick below: opening the lid ends the lid cap.
+                self.endAway()
                 self.refreshPreflight()
             }
+            self.guardrails.tick()
         }
         guardrails.onLidCapWarning = { [weak self] mins in
-            self?.notifications.post(.lidCapWarning(minutes: mins))
+            // The cap only ends a lock; with none held there is nothing to warn about.
+            guard let self, self.power.isArmed else { return }
+            self.notifications.post(.lidCapWarning(minutes: mins))
         }
-
 
         lifecycle.onShouldArmChange = { [weak self] want in
             guard let self else { return }
             self.agentsWantLock = want
             self.evaluate()
-            self.notifications.post(want ? .lockEngaged : .sessionComplete)
+        }
+
+        // A lid test ending, a rule change, or a flag cleared behind our back can each
+        // change what the lock should be.
+        power.onStateChange = { [weak self] in
+            guard let self else { return }
+            // Docking or undocking with the lid still shut moves the away window: undocked
+            // is the bag, docked is the desk.
+            if self.power.lidShutUndocked, self.lidClosedAt == nil {
+                self.startAway(since: self.power.lidClosedSince ?? Date())
+            } else if self.power.docked, self.lidClosedAt != nil {
+                self.endAway()
+            }
+            self.evaluate()
         }
 
         // Session list changes that do not flip the arm decision (a new session appearing,
@@ -93,15 +111,29 @@ final class AppState {
 
         guardrails.onYieldChange = { [weak self] reason in
             guard let self else { return }
+            let wasArmed = self.power.isArmed
             self.evaluate()
-            if let reason { self.notifications.post(.guardrailTripped(reason)) }
+            guard let reason else { return }
+            // Only a guardrail that actually released a lock is news, here and in the away
+            // report. Unplugging with no agent working used to chime "wake lock released"
+            // for a lock never held.
+            if wasArmed, !self.power.isArmed {
+                if self.lidClosedAt != nil { self.awayTrips.append(reason.summary) }
+                self.notifications.post(.guardrailTripped(reason))
+            }
         }
 
         notifications.onToggle = { [weak self] in self?.toggleFromHotkey() }
 
         // The lid-closed cap is time-based: nothing fires an event when it expires.
+        // Pause expiry is checked here too: the one-shot pause timer does not fire while the
+        // Mac sleeps, which left the lock released long after the pause ran out.
         guardrailTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.guardrails.tick() }
+            Task { @MainActor in
+                guard let self else { return }
+                if self.pausedUntil != nil, !self.isPaused { self.resume() }
+                self.guardrails.tick()
+            }
         }
 
         // A crash-restart should not abandon agents that are still running. This must run
@@ -110,6 +142,9 @@ final class AppState {
         lifecycle.readoptSurvivingSessions()
 
         evaluate()
+        // Recovery cleared a flag that had vetoed the lid-close sleep. With nothing to
+        // hold the lock now, that sleep has to be asked for, as disarm() would have.
+        if power.recoveredAtLaunch, !power.isArmed { power.sleepNowIfLidShut() }
 
         // First run: the two things that cannot happen silently (an admin password and
         // editing the user's agent config) get an explicit, previewable pass.
@@ -122,10 +157,23 @@ final class AppState {
 
     func evaluate() {
         let wasArmed = power.isArmed
+        let wasHeldForAgents = heldForAgents
         if wantsLock {
             power.arm()
         } else {
             power.disarm()
+        }
+        heldForAgents = power.isArmed && mode == .auto && agentsWantLock && !power.lidTestRunning
+        // Banners follow the lock itself, not agent intent: an agent starting while paused
+        // or blocked used to announce a lock that was never taken. Forced mode and the lid
+        // test are the user's own doing, so they get no banner. A guardrail release posts
+        // its own, more specific one. "Session complete" only when the agents going idle
+        // is what let go: not a pause, leaving Always, or the end of a lid test.
+        if !wasArmed, power.isArmed, mode == .auto, !power.lidTestRunning {
+            notifications.post(.lockEngaged)
+        } else if wasArmed, !power.isArmed, wasHeldForAgents, !agentsWantLock,
+                  !guardrails.isBlocking {
+            notifications.post(.sessionComplete)
         }
         // Only on the transition into armed, so this is not re-run on every hook event.
         if !wasArmed, power.isArmed { refreshPreflight() }
@@ -161,6 +209,8 @@ final class AppState {
 
     var wantsLock: Bool {
         if guardrails.isBlocking { return false }
+        // A running lid test needs the lock whatever the mode, but never past a guardrail.
+        if power.lidTestRunning { return true }
         if isPaused { return false }
         switch mode {
         case .disabled: return false
@@ -191,10 +241,18 @@ final class AppState {
         evaluate()
     }
 
-    /// Option-Command-L. Forced <-> Auto, or un-pause if paused.
+    /// Control-Option-Command-L. Forced <-> Auto, or un-pause if paused. Always
+    /// announced: a global shortcut pressed by accident must not silently hold the Mac awake.
     func toggleFromHotkey() {
-        if isPaused { resume(); return }
-        mode = (mode == .forced) ? .auto : .forced
+        if isPaused { resume() } else { mode = (mode == .forced) ? .auto : .forced }
+        var text: String
+        switch mode {
+        case .forced:   text = "Always awake, until you press ⌃⌥⌘L again."
+        case .auto:     text = "Automatic: awake only while an agent works."
+        case .disabled: text = "Off: Lucid is not keeping this Mac awake."
+        }
+        if mode != .disabled, let r = guardrails.yieldReason { text += " Held off for now: \(r.short)." }
+        notifications.post(.shortcut(text))
     }
 
     func settingsChanged() {
@@ -204,10 +262,11 @@ final class AppState {
         // layer has to be reapplied explicitly or the toggle does nothing until the next
         // disarm/arm cycle.
         power.applyLidCoverage()
+        writeStatusFile()
     }
 
     func refreshPrivilegeRule() {
-        privilegeRuleInstalled = PowerManager.isPrivilegeRuleInstalled()
+        power.refreshRuleInstalled()
         loginItemEnabled = LoginItem.isEnabled
     }
 
@@ -270,6 +329,30 @@ final class AppState {
     /// it or the lid shuts again.
     var awayReport: AwayReport?
     private var lidClosedAt: Date?
+    /// Battery at the moment the lid shut, or nil if it shut on AC. One reading for the
+    /// whole window: summing per-session drain counted concurrent sessions twice.
+    private(set) var lidClosedBattery: Int?
+    /// Guardrails that tripped while the lid was shut. The live reason is gone by the time
+    /// the lid opens (opening it ends the lid cap), so the report needs its own record.
+    private(set) var awayTrips: [String] = []
+
+    private func startAway(since: Date) {
+        lidClosedAt = since
+        lidClosedBattery = guardrails.onACPower ? nil : guardrails.batteryPercent
+        awayTrips = []
+        awayReport = nil
+    }
+
+    /// The user is back: the lid opened, or the Mac was docked with the lid still shut.
+    private func endAway() {
+        guard let since = lidClosedAt else { return }
+        lidClosedAt = nil
+        let report = AwayReport.build(closedSince: since, state: self)
+        if report.isWorthShowing {
+            awayReport = report
+            notifications.post(.awayReport(report.headline))
+        }
+    }
 
     func refreshPreflight() {
         guard power.isArmed, !power.lidClosed else { preflightIssues = []; return }

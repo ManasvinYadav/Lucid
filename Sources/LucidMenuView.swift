@@ -135,16 +135,13 @@ struct LucidMenuView: View {
                                    ? nil : "\(state.workingCount) working")
 
             if state.lifecycle.sessions.isEmpty {
+                let empty = emptyState
                 HStack(spacing: 6) {
-                    Image(systemName: state.lifecycle.isListening
-                          ? "ellipsis.circle" : "exclamationmark.octagon.fill")
-                    Text(state.lifecycle.isListening
-                         ? "No agent has reported in yet."
-                         : "Listener unavailable — \(state.lifecycle.listenerError ?? "unknown error")")
-                        .fixedSize(horizontal: false, vertical: true)
+                    Image(systemName: empty.icon)
+                    Text(empty.text).fixedSize(horizontal: false, vertical: true)
                 }
                 .font(.caption)
-                .foregroundStyle(state.lifecycle.isListening ? Color.secondary : Color.red)
+                .foregroundStyle(empty.color)
                 .padding(.horizontal, 14).padding(.bottom, 10)
             } else {
                 VStack(spacing: 0) {
@@ -172,6 +169,21 @@ struct LucidMenuView: View {
             }
             Divider()
         }
+    }
+
+    /// Why the list is empty, which is only sometimes "nothing is running".
+    private var emptyState: (text: String, icon: String, color: Color) {
+        if !state.lifecycle.isListening {
+            return ("Listener unavailable — \(state.lifecycle.listenerError ?? "unknown error")",
+                    "exclamationmark.octagon.fill", .red)
+        }
+        if !AgentRegistry.all.contains(where: \.installed) {
+            return ("No agent hooks installed. Add them in Settings → Agents.",
+                    "exclamationmark.triangle.fill", .orange)
+        }
+        // A session already running when Lucid started shows up at its next hook event.
+        return ("No agent sessions right now. One appears at its next prompt or tool call.",
+                "ellipsis.circle", .secondary)
     }
 
     private func dotColor(_ s: AgentSession) -> Color {
@@ -207,8 +219,9 @@ struct LucidMenuView: View {
             .buttonStyle(.bordered)
             .controlSize(.small)
 
+            // What is in force: without the rule, coverage is off whatever the preference.
             Toggle(isOn: Binding(
-                get: { prefs.lidCloseCoverage },
+                get: { prefs.lidCloseCoverage && state.privilegeRuleInstalled },
                 set: { prefs.lidCloseCoverage = $0; state.settingsChanged() })) {
                     Text("Keep awake with the lid shut").font(.caption)
                 }
@@ -225,7 +238,8 @@ struct LucidMenuView: View {
         HStack(spacing: 0) {
             stat(state.guardrails.onACPower ? "powerplug.fill" : "battery.50",
                  "\(state.guardrails.batteryPercent)%",
-                 state.guardrails.batteryPercent <= prefs.batteryFloor && !state.guardrails.onACPower
+                 state.guardrails.batteryPercent <= prefs.batteryFloor
+                    && !(state.guardrails.onACPower && state.guardrails.isCharging)
                     ? .orange : .secondary)
             stat("thermometer.medium", state.guardrails.thermalState.label,
                  state.guardrails.thermalState == .nominal ? .secondary : .orange)
@@ -252,13 +266,28 @@ struct LucidMenuView: View {
 
     @ViewBuilder private var alerts: some View {
         let items = alertItems
-        if !items.isEmpty {
+        if !items.isEmpty || state.power.lastError != nil {
             VStack(alignment: .leading, spacing: 6) {
                 ForEach(items, id: \.text) { item in
                     Label(item.text, systemImage: item.icon)
                         .font(.caption)
                         .foregroundStyle(item.color)
                         .fixedSize(horizontal: false, vertical: true)
+                }
+                // The one alert that is a message rather than a live condition, so it can
+                // be dismissed; nothing else would ever clear it.
+                if let err = state.power.lastError {
+                    HStack(alignment: .firstTextBaseline) {
+                        Label(err, systemImage: "exclamationmark.octagon.fill")
+                            .font(.caption).foregroundStyle(.red)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Spacer(minLength: 4)
+                        Button { state.power.clearError() } label: {
+                            Image(systemName: "xmark").font(.caption2)
+                        }
+                        .buttonStyle(.plain).foregroundStyle(.secondary)
+                        .help("Dismiss")
+                    }
                 }
             }
             .padding(.horizontal, 14).padding(.vertical, 10)
@@ -271,7 +300,7 @@ struct LucidMenuView: View {
         if let r = state.guardrails.yieldReason {
             out.append((r.summary, "exclamationmark.triangle.fill", .orange))
         }
-        if !state.privilegeRuleInstalled {
+        if prefs.lidCloseCoverage && !state.privilegeRuleInstalled {
             out.append(("Lid-close support needs a one-time setup in Settings → Privileges.",
                         "lock.fill", .orange))
         }
@@ -285,9 +314,6 @@ struct LucidMenuView: View {
                         issue.severity == .blocking
                             ? "exclamationmark.octagon.fill" : "exclamationmark.triangle.fill",
                         issue.severity == .blocking ? .red : .orange))
-        }
-        if let err = state.power.lastError {
-            out.append((err, "exclamationmark.octagon.fill", .red))
         }
         return out
     }

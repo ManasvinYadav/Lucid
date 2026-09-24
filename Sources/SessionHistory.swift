@@ -64,31 +64,58 @@ final class SessionHistory {
 
     // MARK: Aggregates
 
-    func totalAwake(since: Date) -> TimeInterval {
-        records.filter { $0.ended >= since }.reduce(0) { $0 + $1.duration }
+    /// Records merged into non-overlapping spans and clipped to start at `since`. Two
+    /// agents working at once is one stretch of time, not two, and a session that began
+    /// before midnight only counts its part of today.
+    nonisolated static func spans(_ rs: [SessionRecord], since: Date)
+        -> [(start: Date, end: Date, members: [SessionRecord])] {
+        var out: [(start: Date, end: Date, members: [SessionRecord])] = []
+        for r in rs.filter({ $0.ended > since }).sorted(by: { $0.started < $1.started }) {
+            let start = max(r.started, since)
+            if let last = out.last, start <= last.end {
+                out[out.count - 1].end = max(last.end, r.ended)
+                out[out.count - 1].members.append(r)
+            } else {
+                out.append((start, r.ended, [r]))
+            }
+        }
+        return out
     }
 
-    var awakeToday: TimeInterval {
-        totalAwake(since: Calendar.current.startOfDay(for: Date()))
+    /// Wall-clock time at least one of `rs` was working, from `since` on.
+    nonisolated static func workingTime(_ rs: [SessionRecord], since: Date) -> TimeInterval {
+        spans(rs, since: since).reduce(0) { $0 + $1.end.timeIntervalSince($1.start) }
     }
 
-    var byAgentToday: [(agent: String, total: TimeInterval)] {
-        let start = Calendar.current.startOfDay(for: Date())
-        var totals: [String: TimeInterval] = [:]
-        for r in records where r.ended >= start { totals[r.agent, default: 0] += r.duration }
-        return totals.sorted { $0.value > $1.value }.map { (agent: $0.key, total: $0.value) }
-    }
-
-    /// Battery points spent today on agent work, and the hours that covers. Only sessions
-    /// that actually ran on battery contribute, so an all-AC day reports nothing.
-    var batteryTodaySpent: (points: Int, hours: Double)? {
-        let start = Calendar.current.startOfDay(for: Date())
-        let onBattery = records.filter { $0.ended >= start && $0.batterySpent != nil }
-        guard !onBattery.isEmpty else { return nil }
-        let pts = onBattery.reduce(0) { $0 + ($1.batterySpent ?? 0) }
-        let hrs = onBattery.reduce(0.0) { $0 + $1.duration } / 3600
+    /// Battery points spent on agent work, and the hours that covers. Only records that
+    /// ran on battery count, and drain is taken once per overlapping span rather than
+    /// once per session inside it.
+    nonisolated static func batterySpent(_ rs: [SessionRecord], since: Date)
+        -> (points: Int, hours: Double)? {
+        let groups = spans(rs.filter { $0.batterySpent != nil }, since: since)
+        let pts = groups.reduce(0) { acc, g in
+            let hi = g.members.compactMap(\.batteryStart).max() ?? 0
+            let lo = g.members.compactMap(\.batteryEnd).min() ?? hi
+            return acc + max(0, hi - lo)
+        }
+        let hrs = groups.reduce(0) { $0 + $1.end.timeIntervalSince($1.start) } / 3600
         guard pts > 0, hrs > 0 else { return nil }
         return (pts, hrs)
+    }
+
+    private var startOfToday: Date { Calendar.current.startOfDay(for: Date()) }
+
+    var awakeToday: TimeInterval { Self.workingTime(records, since: startOfToday) }
+
+    var byAgentToday: [(agent: String, total: TimeInterval)] {
+        Dictionary(grouping: records, by: \.agent)
+            .map { (agent: $0.key, total: Self.workingTime($0.value, since: startOfToday)) }
+            .filter { $0.total > 0 }
+            .sorted { $0.total > $1.total }
+    }
+
+    var batteryTodaySpent: (points: Int, hours: Double)? {
+        Self.batterySpent(records, since: startOfToday)
     }
 
     func clear() {
@@ -101,7 +128,15 @@ final class SessionHistory {
     private func load() {
         guard let data = try? Data(contentsOf: AppPaths.history) else { return }
         let dec = JSONDecoder(); dec.dateDecodingStrategy = .iso8601
-        records = (try? dec.decode([SessionRecord].self, from: data)) ?? []
+        do {
+            records = try dec.decode([SessionRecord].self, from: data)
+        } catch {
+            // Kept, not overwritten by the next save: it may be recoverable by hand.
+            let aside = AppPaths.history.appendingPathExtension(
+                "corrupt-\(Int(Date().timeIntervalSince1970))")
+            try? FileManager.default.moveItem(at: AppPaths.history, to: aside)
+            records = []
+        }
         prune()
     }
 

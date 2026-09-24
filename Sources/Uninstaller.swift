@@ -2,9 +2,9 @@ import Foundation
 
 /// Undoes everything the app put on the system.
 ///
-/// Order matters: disarm first. If the sudoers rule goes before `SleepDisabled` is
-/// cleared, we lose the ability to clear it and the Mac is left permanently unable to
-/// sleep — the exact state the arm-marker exists to prevent.
+/// Order matters: release the lock first. If the sudoers rule or the arm marker goes
+/// while a SleepDisabled flag we set is still on, nothing is left that can clear it and
+/// the Mac cannot sleep again, across reboots.
 @MainActor
 enum Uninstaller {
 
@@ -15,49 +15,76 @@ enum Uninstaller {
         let ok: Bool
     }
 
-    /// Everything except the sudoers rule, which needs an admin prompt and is offered
-    /// separately so the user can keep it if they plan to reinstall.
-    static func run(power: PowerManager, removePrivilege: Bool) -> [Step] {
+    /// Disarms, then says whether nothing Lucid set is left for the steps below to orphan.
+    private static func released(_ power: PowerManager) -> Bool {
+        power.disarm()
+        // A marker with the flag clear and not ours is a leftover (a recovery that failed,
+        // then fixed by hand), which launch recovery would delete the same way.
+        if !power.ownsSleepDisabled, PowerManager.readSleepDisabled() == false {
+            try? FileManager.default.removeItem(at: AppPaths.armMarker)
+        }
+        return !power.ownsSleepDisabled
+            && !FileManager.default.fileExists(atPath: AppPaths.armMarker.path)
+    }
+
+    private static var stopped: Step {
+        Step(name: "Stopped — the wake lock did not release",
+             detail: "Lucid could not clear the SleepDisabled flag it set. Clear it first with: "
+                   + "sudo pmset -a disablesleep 0",
+             ok: false)
+    }
+
+    /// The caller must already have stopped the lock from re-arming (mode off).
+    static func run(power: PowerManager, removePrivilege: Bool) async -> [Step] {
         var steps: [Step] = []
 
-        // 1. Disarm. Always first, and a hard gate on everything after it.
-        power.disarm()
-        let disabled = PowerManager.readSleepDisabled()
-        guard disabled != true else {
-            // Stop here. Steps 4 and 5 delete the arm marker and the privilege rule —
-            // between them, the only two ways left to clear the flag. Removing them
-            // while SleepDisabled is still 1 would leave a Mac that can never sleep
-            // again, across reboots, with nothing left to fix it.
-            return [Step(name: "Stopped — the wake lock did not release",
-                         detail: "SleepDisabled is still 1. Clear it first with: "
-                               + "sudo pmset -a disablesleep 0",
-                         ok: false)]
-        }
+        // 1. Release. The gate is ownership, not the live flag: a flag the user set
+        // themselves does not depend on anything below, but one we set, or one a crashed
+        // run left behind, does.
+        guard released(power) else { return [stopped] }
+        let live = PowerManager.readSleepDisabled()
         steps.append(Step(name: "Released the wake lock",
-                          detail: disabled == false ? "SleepDisabled is 0"
-                                                    : "SleepDisabled unreadable, nothing was engaged",
+                          detail: live == true ? "SleepDisabled is 1, set outside Lucid — left as it is"
+                                               : "SleepDisabled is 0",
                           ok: true))
 
         // 2. Hooks, per agent that actually has them.
-        for agent in AgentRegistry.all where agent.installed {
+        var hooksLeft = false
+        for agent in AgentRegistry.all where agent.installed || agent.outdated {
             let r = HookInstaller.run(agent: agent.id, "--uninstall")
+            if !r.ok { hooksLeft = true }
             steps.append(Step(name: "Removed \(agent.name) hooks",
-                              detail: r.ok ? "config restored (a .bak was kept)"
+                              detail: r.ok ? "Lucid's entries removed"
                                            : r.output.trimmingCharacters(in: .whitespacesAndNewlines),
                               ok: r.ok))
         }
 
-        // 3. Launch at login.
-        if LoginItem.isEnabled {
-            let ok = LoginItem.setEnabled(false)
-            steps.append(Step(name: "Removed the login item",
-                              detail: LoginItem.plistURL.path, ok: ok))
+        // 3. The sudoers rule. Needs the admin prompt, so it is optional.
+        if removePrivilege && power.ruleInstalled {
+            let ok = await power.removePrivilegeRule()
+            steps.append(Step(name: "Removed the privilege rule",
+                              detail: ok ? AppPaths.sudoersFile
+                                          : "cancelled — run: sudo rm \(AppPaths.sudoersFile)",
+                              ok: ok))
         }
 
         // 4. Support directory — socket, arm marker, status, history, notify script.
+        // Again: the admin prompt above freed the main actor, and a lid test or ⌃⌥⌘L can
+        // re-arm meanwhile. Deleting the marker under a flag we hold orphans it.
+        guard released(power) else { return steps + [stopped] }
+        let dir = AppPaths.dir
         do {
-            if FileManager.default.fileExists(atPath: AppPaths.dir.path) {
-                try FileManager.default.removeItem(at: AppPaths.dir)
+            AppPaths.removed = true       // nothing may recreate it on the way out
+            let fm = FileManager.default
+            if hooksLeft {
+                // Hooks we could not remove still call lucid-notify. Left in place it exits
+                // quietly once the socket is gone; deleted, every hook event fails.
+                for name in (try? fm.contentsOfDirectory(atPath: dir.path)) ?? []
+                where name != "lucid-notify" {
+                    try fm.removeItem(at: dir.appendingPathComponent(name))
+                }
+            } else if fm.fileExists(atPath: dir.path) {
+                try fm.removeItem(at: dir)
             }
             // Preferences live in the defaults domain, not in ~/.lucid, so removing
             // the directory alone would leave setupComplete set and a reinstall would
@@ -66,19 +93,19 @@ enum Uninstaller {
                 UserDefaults.standard.removePersistentDomain(forName: id)
             }
             steps.append(Step(name: "Deleted app data and preferences",
-                              detail: AppPaths.dir.path, ok: true))
+                              detail: hooksLeft ? "\(dir.path) (kept lucid-notify: some hooks still call it)"
+                                                : dir.path,
+                              ok: true))
         } catch {
             steps.append(Step(name: "Deleted app data",
                               detail: error.localizedDescription, ok: false))
         }
 
-        // 5. The sudoers rule, last, because it needs the admin prompt.
-        if removePrivilege && PowerManager.isPrivilegeRuleInstalled() {
-            let ok = power.removePrivilegeRule()
-            steps.append(Step(name: "Removed the privilege rule",
-                              detail: ok ? AppPaths.sudoersFile
-                                          : "cancelled — run: sudo rm \(AppPaths.sudoersFile)",
-                              ok: ok))
+        // 5. Launch at login.
+        if LoginItem.plistExists {
+            let ok = LoginItem.setEnabled(false)
+            steps.append(Step(name: "Removed the login item",
+                              detail: LoginItem.plistURL.path, ok: ok))
         }
 
         return steps

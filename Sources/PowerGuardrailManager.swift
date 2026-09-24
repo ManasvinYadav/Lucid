@@ -212,7 +212,9 @@ final class PowerGuardrailManager {
 
         if prefs.yieldOnLowPowerMode && lowPowerMode { return .lowPowerMode }
         if prefs.acPowerOnly && !onACPower { return .notOnACPower }
-        if !onACPower && batteryPercent < prefs.batteryFloor {
+        // Any time the battery is not actually gaining charge: a charger too weak for the
+        // load reads as AC while the battery drains straight through the floor.
+        if !(onACPower && isCharging) && batteryPercent < prefs.batteryFloor {
             return .batteryFloor(pct: batteryPercent, floor: prefs.batteryFloor)
         }
         return nil

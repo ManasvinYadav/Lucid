@@ -19,6 +19,11 @@ struct SettingsView: View {
                 .tabItem { Label("Diagnostics", systemImage: "stethoscope") }
         }
         .frame(width: 560, height: 500)
+        // Both can change behind the app's back, in System Settings or a terminal.
+        .onAppear {
+            state.notifications.refreshAuthorization()
+            state.refreshPrivilegeRule()
+        }
     }
 }
 
@@ -101,8 +106,21 @@ struct GeneralSettings: View {
 
             Section("Feedback") {
                 Toggle("Notification banners", isOn: $prefs.notificationsEnabled)
+                if prefs.notificationsEnabled && state.notifications.notificationsBlocked {
+                    HStack {
+                        Label("Blocked by macOS, so no banners are shown.",
+                              systemImage: "exclamationmark.triangle")
+                            .font(.caption).foregroundStyle(.orange)
+                        Spacer()
+                        Button("Open Notification Settings") {
+                            NSWorkspace.shared.open(URL(string:
+                                "x-apple.systempreferences:com.apple.Notifications-Settings.extension")!)
+                        }
+                        .controlSize(.small)
+                    }
+                }
                 Toggle("Play chimes", isOn: $prefs.chimesEnabled)
-                Toggle("Global shortcut (⌥⌘L)", isOn: $prefs.hotkeyEnabled)
+                Toggle("Global shortcut (⌃⌥⌘L)", isOn: $prefs.hotkeyEnabled)
                     .onChange(of: prefs.hotkeyEnabled) { _, on in
                         state.notifications.setHotKeyEnabled(on)
                     }
@@ -121,9 +139,12 @@ struct GeneralSettings: View {
         .confirmationDialog("Remove Lucid from this Mac?",
                             isPresented: $showUninstall, titleVisibility: .visible) {
             Button("Remove Everything", role: .destructive) {
-                uninstallSteps = Uninstaller.run(power: state.power,
-                                                 removePrivilege: uninstallPrivilege)
-                state.refreshPrivilegeRule()
+                // Off first, so no agent event can re-arm the lock part-way through.
+                state.mode = .disabled
+                Task {
+                    uninstallSteps = await Uninstaller.run(power: state.power,
+                                                           removePrivilege: uninstallPrivilege)
+                }
             }
             Button("Cancel", role: .cancel) {}
         } message: {
@@ -131,18 +152,21 @@ struct GeneralSettings: View {
         }
         .sheet(isPresented: .init(get: { !uninstallSteps.isEmpty },
                                   set: { if !$0 { uninstallSteps = [] } })) {
-            UninstallReport(steps: uninstallSteps) { uninstallSteps = [] }
+            UninstallReport(steps: uninstallSteps)
         }
     }
 }
 
 private struct UninstallReport: View {
     let steps: [Uninstaller.Step]
-    let done: () -> Void
+
+    /// Stopped before anything was removed; Lucid is still installed and still needed.
+    private var stopped: Bool { steps.count == 1 && !steps[0].ok }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            Text("Uninstall complete").font(.title3.weight(.semibold))
+            Text(stopped ? "Uninstall stopped" : "Uninstall complete")
+                .font(.title3.weight(.semibold))
             ForEach(steps) { s in
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
                     Image(systemName: s.ok ? "checkmark.circle.fill"
@@ -156,19 +180,25 @@ private struct UninstallReport: View {
                 }
             }
             Divider()
-            Text("Remove the app bundle manually:")
-                .font(.caption).foregroundStyle(.secondary)
-            Text(Uninstaller.bundlePath)
-                .font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+            if !stopped {
+                Text("Remove the app bundle manually:")
+                    .font(.caption).foregroundStyle(.secondary)
+                Text(Uninstaller.bundlePath)
+                    .font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+            }
             HStack {
-                Button("Reveal in Finder") {
-                    NSWorkspace.shared.activateFileViewerSelecting([
-                        URL(fileURLWithPath: Uninstaller.bundlePath)])
+                if !stopped {
+                    Button("Reveal in Finder") {
+                        NSWorkspace.shared.activateFileViewerSelecting([
+                            URL(fileURLWithPath: Uninstaller.bundlePath)])
+                    }
                 }
                 Spacer()
+                // No Close: with its data and hooks gone, a still-running Lucid has
+                // nothing left to work with.
                 Button("Quit Lucid") { NSApp.terminate(nil) }
                     .buttonStyle(.borderedProminent)
-                Button("Close", action: done)
+                    .keyboardShortcut(.defaultAction)
             }
         }
         .padding(20).frame(width: 460)
@@ -248,7 +278,7 @@ struct PowerSettings: View {
                        isOn: $prefs.yieldOnLowPowerMode)
                     .onChange(of: prefs.yieldOnLowPowerMode) { _, _ in state.settingsChanged() }
 
-                Hint("Thermal release is always on: yields at Critical, and at Serious while the lid is shut. There is no temperature threshold.")
+                Hint("Thermal release is always on: yields at Critical, and at Serious while the lid is shut with no external display. There is no temperature threshold.")
             }
 
             Section("Time limit") {
@@ -281,9 +311,11 @@ struct PowerSettings: View {
             }
 
             Section("Display") {
-                Toggle("Keep awake with the lid closed", isOn: $prefs.lidCloseCoverage)
+                // Shows what is in force, not the stored wish: without the rule it is off.
+                Toggle("Keep awake with the lid closed", isOn: .init(
+                    get: { prefs.lidCloseCoverage && state.privilegeRuleInstalled },
+                    set: { prefs.lidCloseCoverage = $0; state.settingsChanged() }))
                     .disabled(!state.privilegeRuleInstalled)
-                    .onChange(of: prefs.lidCloseCoverage) { _, _ in state.settingsChanged() }
                 if !state.privilegeRuleInstalled {
                     Label("Needs the privilege rule — see Privileges.",
                           systemImage: "lock").font(.caption).foregroundStyle(.orange)
@@ -345,7 +377,7 @@ struct AgentSettings: View {
                     }
                 }
                 .disabled(!prefs.processFallbackEnabled)
-                Hint("Matched as substrings against the full executable path. Used for GUI tools like Cursor and Cline that can't report their own state.")
+                Hint("Case-insensitive, matched against the process name (and, for node, python, bun, deno and ruby, the script it runs). An entry with a / is matched against the full path instead. For tools that can't report their own state.")
 
                 VStack(spacing: 0) {
                     ForEach(Array(prefs.processWhitelist.enumerated()), id: \.offset) { i, item in
@@ -441,18 +473,13 @@ private struct AgentRow: View {
     @Binding var log: String?
     @Binding var wrapperFor: String?
 
-    private var isManual: Bool {
-        if case .manual = agent.mechanism { return true }
-        return false
-    }
-
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
                 Text(agent.name).fontWeight(.medium)
                 if agent.verified {
                     Badge(text: "verified", color: .green)
-                } else if !isManual {
+                } else if !agent.isManual {
                     Badge(text: "best-effort", color: .orange)
                 }
                 Spacer()
@@ -468,13 +495,15 @@ private struct AgentRow: View {
                 .fixedSize(horizontal: false, vertical: true)
 
             HStack {
-                if isManual {
+                if agent.isManual {
                     Button("Show wrapper…") { wrapperFor = agent.id }
                 } else {
-                    Button(agent.installed ? "Reinstall" : "Install") { run("--apply") }
+                    Button(agent.installed ? "Reinstall" : agent.outdated ? "Update" : "Install") {
+                        run("--apply")
+                    }
                         .disabled(!agent.detected)
                     Button("Remove") { run("--uninstall") }
-                        .disabled(!agent.installed)
+                        .disabled(!agent.installed && !agent.outdated)
                     Button("Preview") { run("preview") }
                         .disabled(!agent.detected)
                 }
@@ -488,6 +517,8 @@ private struct AgentRow: View {
         if agent.installed {
             Label("Installed", systemImage: "checkmark.circle.fill")
                 .foregroundStyle(.green)
+        } else if agent.outdated {
+            Label("Outdated", systemImage: "exclamationmark.circle").foregroundStyle(.orange)
         } else if agent.detected {
             Label("Detected", systemImage: "circle.dashed").foregroundStyle(.orange)
         } else {
@@ -522,16 +553,16 @@ struct PrivilegeSettings: View {
                 }
             }
 
-            Section("You may not need this") {
+            Section("Why it is needed") {
                 Hint("""
-                     Lucid always holds a PreventUserIdleSystemSleep assertion, which \
-                     needs no privileges. On many Apple Silicon Macs that alone is enough to \
-                     survive a lid close, and this whole tab is unnecessary.
+                     Lucid always holds a PreventUserIdleSystemSleep assertion, which needs \
+                     no privileges, but it only stops idle sleep. Closing the lid is a demand \
+                     sleep that macOS does not let an assertion veto, unless an external \
+                     display is attached.
 
-                     The rule below is the fallback for machines where it is not: it allows \
-                     setting the root-only SleepDisabled flag. Run the lid test in \
-                     Diagnostics first — it answers which one this Mac needs, and if the \
-                     assertion alone holds, remove this rule.
+                     Keeping the Mac awake with the lid shut takes the root-only \
+                     SleepDisabled flag, and this rule lets Lucid set it without a password. \
+                     The lid test in Diagnostics checks what this Mac actually does.
 
                      The rule is limited to exactly two commands. It is not `pmset *`, which \
                      would be a general root escalation.
@@ -549,20 +580,30 @@ struct PrivilegeSettings: View {
             Section {
                 HStack {
                     Button(state.privilegeRuleInstalled ? "Reinstall…" : "Install…") {
-                        state.power.installPrivilegeRule(); state.refreshPrivilegeRule()
+                        run { _ = await state.power.installPrivilegeRule() }
                     }
                     .buttonStyle(.borderedProminent)
                     Button("Remove") {
-                        state.power.removePrivilegeRule(); state.refreshPrivilegeRule()
+                        run { _ = await state.power.removePrivilegeRule() }
                     }
                     .disabled(!state.privilegeRuleInstalled)
                     Spacer()
+                    if pending { ProgressView().controlSize(.small) }
                     Text("Asks for your password once")
                         .font(.caption).foregroundStyle(.secondary)
                 }
+                .disabled(pending)
             }
         }
         .formStyle(.grouped)
+    }
+
+    @State private var pending = false
+
+    /// One admin prompt at a time; the dialog can stay open for as long as the user likes.
+    private func run(_ op: @escaping () async -> Void) {
+        pending = true
+        Task { await op(); pending = false }
     }
 }
 
@@ -580,7 +621,7 @@ struct HistorySettings: View {
     var body: some View {
         Form {
             Section("Today") {
-                LabeledContent("Time held awake",
+                LabeledContent("Agent working time",
                                value: history.awakeToday.compactDuration)
                 if let cost = history.batteryTodaySpent {
                     LabeledContent("Battery spent") {
@@ -600,7 +641,7 @@ struct HistorySettings: View {
 
             Section("Sessions") {
                 if history.records.isEmpty {
-                    Text("Nothing recorded yet. A session is written when an agent finishes, exits, or is reaped.")
+                    Text("Nothing recorded yet. A row is written when an agent finishes a turn, exits, or is reaped.")
                         .font(.caption).foregroundStyle(.secondary)
                 } else {
                     ForEach(history.records) { r in          // already newest-first
@@ -671,7 +712,7 @@ struct DiagnosticsSettings: View {
 
             Section("Lock failures") {
                 if let f = state.power.lastFailedSleep {
-                    Label("Slept while armed at \(fmt.string(from: f)) — the lock did not hold",
+                    Label("Slept at \(fmt.string(from: f)) while the lock was held. Either the lock did not hold, or sleep was requested (Apple menu, power button, critical battery).",
                           systemImage: "exclamationmark.octagon.fill")
                         .foregroundStyle(.red)
                     Button("Clear") { state.power.clearFailureRecord() }
