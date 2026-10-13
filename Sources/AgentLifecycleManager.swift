@@ -34,7 +34,7 @@ enum SessionSource: String {
     }
 }
 
-struct AgentSession: Identifiable {
+struct AgentSession: Identifiable, Equatable {
     let key: String
     var agent: String
     var sessionID: String
@@ -53,6 +53,13 @@ struct AgentSession: Identifiable {
 
     var id: String { key }
     var isWorking: Bool { status == .working }
+
+    /// Equal in everything but the heartbeat time, which nothing on screen shows.
+    func matchesIgnoringHeartbeat(_ other: AgentSession) -> Bool {
+        var other = other
+        other.lastSeen = lastSeen
+        return self == other
+    }
 
     var displayName: String {
         // A process row's agent is its whitelist entry, which may be a path fragment.
@@ -345,10 +352,15 @@ final class AgentLifecycleManager {
     // MARK: - Arming decision
 
     private func publish() {
-        sessions = registry.values.sorted {
+        let sorted = registry.values.sorted {
             if $0.isWorking != $1.isWorking { return $0.isWorking }
             return $0.displayName < $1.displayName
         }
+        // Most hook events are heartbeats that change nothing shown. Reassigning the list
+        // for those re-rendered the menu on every tool call of every session.
+        let listChanged = !sorted.elementsEqual(sessions) { $0.matchesIgnoringHeartbeat($1) }
+        if listChanged { sessions = sorted }
+        let graceBefore = graceRemaining
 
         let anyWorking = registry.values.contains { $0.isWorking }
 
@@ -366,7 +378,7 @@ final class AgentLifecycleManager {
 
         // Last, so observers see the arming decision and the countdown together with
         // the session list rather than one step behind it.
-        onSessionsChanged?()
+        if listChanged || graceRemaining != graceBefore { onSessionsChanged?() }
     }
 
     /// Hold the lock briefly after the last session goes idle, so a quick follow-up
